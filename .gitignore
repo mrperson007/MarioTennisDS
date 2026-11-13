@@ -4,9 +4,11 @@ build/
 *.elf
 *.map
 build.log
+__pycache__/
 host/vbds-*
 
 # Your ROM and code generated from it stay local
-nitrofiles/*.vb
+*.vb
+*.zip
 roms/
 generated-lean/

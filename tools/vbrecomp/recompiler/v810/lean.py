@@ -1,0 +1,771 @@
+"""Lean V810 -> C emitter for small targets (Nintendo DS class hardware).
+
+The stock emitter (`emitter.py`) is built for cycle-exact comparison with a
+reference emulator: every instruction is a resume point, carries its own
+budget check, PC store, debugger hook and pipeline-timing charge, and writes
+all four arithmetic flags to memory.  That is the right trade for a desktop
+build and far too large for a 4 MB machine.
+
+This module reuses the stock per-instruction translations and changes what
+surrounds them:
+
+  * Resume points exist only at basic-block leaders.
+  * Cycles are charged once per block from a static cost model.
+  * Yield checks sit on loop headers and in the dispatch loop only.
+  * Flag writes that nothing can observe are removed (whole-program
+    liveness); flags used only inside their own block stay in C locals, and
+    compare-and-branch pairs become a plain C comparison.
+  * JAL to a known function is a direct C call.
+  * Functions at odd addresses (heuristic false positives) are not
+    emitted.
+
+Every hardware touch point goes through a `VB_LEAN_*` macro declared in
+`runtime/include/vb_lean.h`, so a port can replace cycle counting, yield
+checks and bus access without regenerating code.
+
+Behaviour is instruction-accurate but not cycle-exact: device time is
+advanced at block granularity.
+"""
+from __future__ import annotations
+
+import re
+import zlib
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+from .analysis import FunctionRange, RomImage, discover_functions
+from .cycles import BCOND_TAKEN_EXTRA, instr_base_cycles
+from .decoder import DecodedInstruction
+from .emitter import (
+    CodegenResult,
+    _BCOND_C_EXPR,
+    _bb_label,
+    _emit_straight_line,
+    _fn_symbol,
+    emit_header,
+)
+from .isa import Format
+
+Z, S, OV, CY = 1, 2, 4, 8
+ALL = Z | S | OV | CY
+_FLAG_BIT = {"z": Z, "s": S, "ov": OV, "cy": CY}
+_FLAG_NAMES = ("z", "s", "ov", "cy")
+
+_DEF_RE = re.compile(r"cpu->psw_(z|s|ov|cy)\s*=(?!=)")
+_USE_RE = re.compile(r"cpu->psw_(z|s|ov|cy)\b(?!\s*=(?!=))")
+_BUS_RE = re.compile(r"cpu->(read|write)(8|16|32)\(")
+# Calls that read or write the packed PSW through the CPU struct; flags must
+# be in memory when they run.
+_SYNC_MARKERS = ("vb_psw_pack(", "vb_exception(", "vb_trap(", "vb_reti(",
+                 "vb_interpreter_extended(", "vb_stub_abort_simple(",
+                 "vb_psw_unpack(")
+
+# Bcond/SETF condition -> C comparison over the operands of the last
+# CMP/SUB (lc_a - lc_b).  Conditions absent here use the flag form.
+_FUSED_CMP: Dict[int, str] = {
+    0x1: "(lc_a < lc_b)",
+    0x2: "(lc_a == lc_b)",
+    0x3: "(lc_a <= lc_b)",
+    0x4: "((int32_t)(lc_a - lc_b) < 0)",
+    0x6: "((int32_t)lc_a < (int32_t)lc_b)",
+    0x7: "((int32_t)lc_a <= (int32_t)lc_b)",
+    0x9: "(lc_a >= lc_b)",
+    0xA: "(lc_a != lc_b)",
+    0xB: "(lc_a > lc_b)",
+    0xC: "((int32_t)(lc_a - lc_b) >= 0)",
+    0xE: "((int32_t)lc_a >= (int32_t)lc_b)",
+    0xF: "((int32_t)lc_a > (int32_t)lc_b)",
+}
+_COND_FLAGS: Dict[int, int] = {
+    c: sum(_FLAG_BIT[m.group(1)] for m in _USE_RE.finditer(e))
+    for c, e in _BCOND_C_EXPR.items()
+}
+
+
+def _mask(names: Iterable[str]) -> int:
+    m = 0
+    for n in names:
+        m |= _FLAG_BIT[n]
+    return m
+
+
+# ---------- instruction classification ----------
+
+def _is_bcond(ins: DecodedInstruction) -> bool:
+    return ins.fmt is Format.III and not ins.is_unknown
+
+
+def _is_cond_branch(ins: DecodedInstruction) -> bool:
+    """Bcond that may or may not be taken (excludes BR and NOP)."""
+    return _is_bcond(ins) and ins.mnemonic != "NOP" and ins.cond != 5
+
+
+def _is_always_branch(ins: DecodedInstruction) -> bool:
+    return _is_bcond(ins) and ins.mnemonic != "NOP" and ins.cond == 5
+
+
+def _is_jr(ins: DecodedInstruction) -> bool:
+    return ins.fmt is Format.IV and ins.opcode6 == 0x2A and not ins.is_unknown
+
+
+def _is_jal(ins: DecodedInstruction) -> bool:
+    return ins.fmt is Format.IV and ins.opcode6 == 0x2B and not ins.is_unknown
+
+
+def _is_jmp(ins: DecodedInstruction) -> bool:
+    return ins.fmt is Format.I and ins.opcode6 == 0x06 and not ins.is_unknown
+
+
+def _is_irq_window(ins: DecodedInstruction) -> bool:
+    """CLI and LDSR-to-PSW can unmask a pending interrupt."""
+    if ins.is_unknown or ins.fmt is not Format.II:
+        return False
+    return ins.opcode6 == 0x16 or (ins.opcode6 == 0x1C and ins.imm5 == 5)
+
+
+def _is_extended(ins: DecodedInstruction) -> bool:
+    return ins.fmt is Format.VII and not ins.is_unknown
+
+
+def _is_div(ins: DecodedInstruction) -> bool:
+    return (ins.fmt is Format.I and ins.opcode6 in (0x09, 0x0B)
+            and not ins.is_unknown)
+
+
+def _returns(ins: DecodedInstruction) -> bool:
+    """Straight-line instruction whose translation always leaves the C
+    function (TRAP / RETI / HALT / extended helper / undecodable)."""
+    if ins.is_unknown or _is_extended(ins):
+        return True
+    return ins.fmt is Format.II and ins.opcode6 in (0x18, 0x19, 0x1A)
+
+
+def _static_cost(ins: DecodedInstruction, prev_class: int) -> Tuple[int, int]:
+    """Static mirror of runtime `vb_execution_charge` (load/store pipeline
+    pairing on the 16-bit bus).  Returns (cycles, new pipeline class)."""
+    op, base, cls = ins.opcode6, instr_base_cycles(ins), 0
+    if ins.is_unknown:
+        return base, 0
+    if op in (0x30, 0x31, 0x33):
+        if prev_class >= 0:
+            base += (1 if prev_class == 1 else 2) + (2 if op == 0x33 else 0)
+        cls = 1
+    elif op in (0x34, 0x35, 0x37):
+        if prev_class == 2:
+            base += 3 if op == 0x37 else 1
+        cls = 2
+    elif op in (0x38, 0x39, 0x3B):
+        if op == 0x3B:
+            base += 2
+        cls = 3
+    elif op in (0x3C, 0x3D, 0x3F):
+        if prev_class == 4:
+            base += 3 if op == 0x3F else 1
+        cls = 4
+    elif 8 <= op <= 11 or op == 0x3E:
+        cls = -1
+    return base, cls
+
+
+def _reg_io(ins: DecodedInstruction) -> Optional[Tuple[Set[int], Set[int], bool]]:
+    """(registers read, registers written, is_load) for instructions with no
+    effect beyond registers and flags; None for everything else."""
+    if ins.is_unknown:
+        return None
+    op, r1, r2 = ins.opcode6, ins.reg1, ins.reg2
+    if ins.fmt is Format.I:
+        if op in (0x00, 0x0F):
+            return {r1}, {r2}, False
+        if op in (0x01, 0x02, 0x04, 0x05, 0x07, 0x0C, 0x0D, 0x0E):
+            return {r1, r2}, {r2}, False
+        if op == 0x03:
+            return {r1, r2}, set(), False
+        return None
+    if ins.fmt is Format.II:
+        if op in (0x10, 0x12):
+            return set(), {r2}, False
+        if op in (0x11, 0x14, 0x15, 0x17):
+            return {r2}, {r2}, False
+        if op == 0x13:
+            return {r2}, set(), False
+        return None
+    if ins.fmt is Format.V and op in (0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F):
+        return {r1}, {r2}, False
+    if ins.fmt is Format.VI and op in (0x30, 0x31, 0x33):
+        return {r1}, {r2}, True
+    return None
+
+
+def _idle_spin_address(body: List[DecodedInstruction]) -> Optional[str]:
+    """If `body` (the instructions between a loop header and a conditional
+    branch back to that header) only recomputes the same values from one
+    memory load, return the C expression of the loaded address.  Such a
+    loop can only exit when something else (an interrupt handler) changes
+    that memory, so a runtime may skip the remaining iterations."""
+    ios = []
+    for ins in body:
+        io = _reg_io(ins)
+        if io is None:
+            return None
+        ios.append(io)
+    written_any: Set[int] = set()
+    for _r, w, _l in ios:
+        written_any |= w
+    written_any.discard(0)
+    done: Set[int] = set()
+    addr: Optional[str] = None
+    for idx, (ins, (reads, writes, is_load)) in enumerate(zip(body, ios)):
+        for r in reads:
+            if r != 0 and r in written_any and r not in done:
+                return None         # value carried between iterations
+        if is_load:
+            if addr is not None:
+                return None
+            later: Set[int] = set()
+            for _r2, w2, _l2 in ios[idx:]:
+                later |= w2
+            if ins.reg1 != 0 and ins.reg1 in later:
+                return None         # base register no longer holds the base
+            addr = f"(cpu->gpr[{ins.reg1}] + (uint32_t)({ins.imm16_s}))"
+        done |= writes
+    return addr
+
+
+# ---------- function / block model ----------
+
+@dataclass
+class _Block:
+    fn_start: int
+    pc: int
+    insns: List[DecodedInstruction]
+    loop_header: bool = False
+    live_in: int = 0
+    live_out: int = ALL
+
+
+@dataclass
+class _Fn:
+    rng: FunctionRange
+    linear: List[DecodedInstruction]
+    linear_pcs: Set[int]
+    fell_off: Optional[int] = None
+    leaders: Set[int] = field(default_factory=set)
+    blocks: List[_Block] = field(default_factory=list)
+    block_at: Dict[int, _Block] = field(default_factory=dict)
+
+
+def _linear(rom: RomImage, rng: FunctionRange) -> _Fn:
+    insns: List[DecodedInstruction] = []
+    pc, fell = rng.start_pc, None
+    while pc < rng.end_pc:
+        ins = rom.decode_at_va(pc)
+        if ins is None:
+            fell = pc
+            break
+        insns.append(ins)
+        pc += max(ins.size, 2)
+    return _Fn(rng=rng, linear=insns, linear_pcs={i.pc for i in insns},
+               fell_off=fell)
+
+
+def _direct_target(ins: DecodedInstruction) -> Optional[int]:
+    if (_is_bcond(ins) and ins.mnemonic != "NOP") or _is_jr(ins) or _is_jal(ins):
+        if ins.branch_target is not None:
+            return ins.branch_target & 0xFFFFFFFF
+    return None
+
+
+def _scan_pointer_words(rom: RomImage) -> Set[int]:
+    """Every in-cart, even 32-bit little-endian word in the ROM image.
+    Jump tables and callback tables are stored this way; promoting each
+    word that lands on an emitted instruction to a leader keeps indirect
+    jumps on native code.  Over-approximation only adds resume points."""
+    data, size = rom.data, rom.rom_size
+    lo = 0x100000000 - size
+    out: Set[int] = set()
+    for off in range(0, size - 3, 2):
+        v = int.from_bytes(data[off:off + 4], "little")
+        if v >= lo and not (v & 1):
+            out.add(v)
+    return out
+
+
+def _build(rom: RomImage, ranges: List[FunctionRange],
+           extra_leaders: Optional[Iterable[int]] = None
+           ) -> Tuple[List[_Fn], Dict[int, int]]:
+    fns = [_linear(rom, r) for r in ranges]
+    fns = [f for f in fns if f.linear]
+
+    targets: Set[int] = {f.rng.start_pc for f in fns}
+    targets |= _scan_pointer_words(rom)
+    if extra_leaders:
+        targets |= {p & 0xFFFFFFFF for p in extra_leaders}
+    for f in fns:
+        for ins in f.linear:
+            t = _direct_target(ins)
+            if t is not None:
+                targets.add(t)
+
+    for f in fns:
+        lead = {f.rng.start_pc}
+        for ins in f.linear:
+            nxt = ins.pc + max(ins.size, 2)
+            starts_block = _is_extended(ins) or _is_div(ins) or ins.is_unknown
+            ends_block = _is_always_branch(ins) or \
+                _is_jr(ins) or _is_jal(ins) or _is_jmp(ins) or \
+                _returns(ins) or _is_irq_window(ins)
+            if starts_block:
+                lead.add(ins.pc)
+            if ends_block and nxt in f.linear_pcs:
+                lead.add(nxt)
+        lead |= targets & f.linear_pcs
+        f.leaders = lead
+        cur: Optional[_Block] = None
+        for ins in f.linear:
+            if ins.pc in lead:
+                cur = _Block(fn_start=f.rng.start_pc, pc=ins.pc, insns=[])
+                f.blocks.append(cur)
+                f.block_at[ins.pc] = cur
+            assert cur is not None
+            cur.insns.append(ins)
+        for ins in f.linear:
+            t = _direct_target(ins)
+            if t is not None and not _is_jal(ins) and t in lead and t <= ins.pc:
+                f.block_at[t].loop_header = True
+
+    # Later functions win on overlap, matching the stock dispatch table.
+    routes: Dict[int, int] = {}
+    for f in sorted(fns, key=lambda x: x.rng.start_pc):
+        for pc in f.leaders:
+            routes[pc] = f.rng.start_pc
+    return fns, routes
+
+
+# ---------- flag liveness ----------
+
+def _raw_text(ins: DecodedInstruction) -> str:
+    if _is_bcond(ins) or _is_jr(ins) or _is_jal(ins) or _is_jmp(ins):
+        return ""
+    return _emit_straight_line(ins)
+
+
+def _ins_effect(ins: DecodedInstruction, text: str,
+                target_live: int = ALL) -> Tuple[int, int, int]:
+    """(defs, uses, mem_uses).  `mem_uses` are flags that must be current
+    in the CPU struct, not only in block-local C variables.  `target_live`
+    is the live-in set at a direct branch target."""
+    if _is_bcond(ins):
+        if ins.mnemonic == "NOP":
+            return 0, 0, 0
+        return 0, _COND_FLAGS.get(ins.cond, 0) | target_live, target_live
+    if _is_jr(ins):
+        return 0, target_live, target_live
+    if _is_jmp(ins):
+        return 0, ALL, ALL
+    if _is_jal(ins):
+        return 0, target_live, target_live
+    defs = _mask(m.group(1) for m in _DEF_RE.finditer(text))
+    uses = _mask(m.group(1) for m in _USE_RE.finditer(text))
+    if any(k in text for k in _SYNC_MARKERS):
+        if "vb_psw_unpack(" in text:
+            return ALL, 0, 0
+        return defs, ALL, ALL
+    return defs, uses, 0
+
+
+class _Liveness:
+    def __init__(self, fns: List[_Fn], routes: Dict[int, int]) -> None:
+        self.routes = routes
+        self.by_start = {f.rng.start_pc: f for f in fns}
+        self.fns = fns
+        self.texts: Dict[int, List[str]] = {}
+        for f in fns:
+            for b in f.blocks:
+                self.texts[id(b)] = [_raw_text(i) for i in b.insns]
+
+    def live_at(self, pc: int, home: _Fn) -> int:
+        blk = home.block_at.get(pc)
+        if blk is None:
+            owner = self.routes.get(pc)
+            if owner is not None:
+                blk = self.by_start[owner].block_at.get(pc)
+        return ALL if blk is None else blk.live_in
+
+    def block_out(self, b: _Block, f: _Fn) -> int:
+        last = b.insns[-1]
+        if _is_jmp(last) or _returns(last) or _is_jr(last) \
+                or _is_always_branch(last):
+            return 0        # every path already left through the last insn
+        return self.live_at(last.pc + max(last.size, 2), f)
+
+    def effects(self, b: _Block, f: _Fn) -> List[Tuple[int, int, int]]:
+        out = []
+        for ins, text in zip(b.insns, self.texts[id(b)]):
+            t = _direct_target(ins)
+            tl = self.live_at(t, f) if t is not None else ALL
+            if _returns(ins):
+                out.append((0, ALL, ALL))
+            else:
+                out.append(_ins_effect(ins, text, tl))
+        return out
+
+    def solve(self) -> None:
+        for f in self.fns:
+            for b in f.blocks:
+                b.live_in, b.live_out = 0, 0
+        changed = True
+        while changed:
+            changed = False
+            for f in reversed(self.fns):
+                for b in reversed(f.blocks):
+                    out = self.block_out(b, f)
+                    live = out
+                    for d, u, _m in reversed(self.effects(b, f)):
+                        live = (live & ~d) | u
+                    if out != b.live_out or live != b.live_in:
+                        b.live_out, b.live_in = out, live
+                        changed = True
+
+
+# ---------- emission ----------
+
+def _rewrite_flags(text: str, live_after: int, mem_after: int) -> str:
+    """Drop dead flag writes; keep block-local ones in C locals."""
+    def sub_def(m: "re.Match[str]") -> str:
+        name = m.group(1)
+        bit = _FLAG_BIT[name]
+        if not (live_after & bit):
+            return f"\0DEAD{name}="
+        if mem_after & bit:
+            return f"cpu->psw_{name}=lf_{name}="
+        return f"lf_{name}="
+    out = _DEF_RE.sub(sub_def, text)
+    out = re.sub(r"\0DEAD(?:z|s|ov|cy)=[^;]*;\s*", "", out)
+    return out
+
+
+def _cond_expr(cond: int, loc: Dict[str, bool], cmp_valid: int) -> str:
+    need = _COND_FLAGS.get(cond, 0)
+    if need and (cmp_valid & need) == need and cond in _FUSED_CMP:
+        return _FUSED_CMP[cond]
+    expr = _BCOND_C_EXPR[cond]
+    return _USE_RE.sub(
+        lambda m: f"lf_{m.group(1)}" if loc.get(m.group(1)) else m.group(0),
+        expr)
+
+
+def _emit_block(f: _Fn, b: _Block, fn_starts: Set[int], lv: "_Liveness",
+                lines: List[str]) -> None:
+    lead = f.leaders
+    texts = lv.texts[id(b)]
+    effects = lv.effects(b, f)
+
+    # Backward pass: flags needed at all / needed in memory after each insn.
+    n = len(b.insns)
+    live_after = [0] * n
+    mem_after = [0] * n
+    live, mem = b.live_out, b.live_out
+    for i in range(n - 1, -1, -1):
+        live_after[i], mem_after[i] = live, mem
+        d, u, m = effects[i]
+        live = (live & ~d) | u
+        mem = (mem & ~d) | m
+
+    # Cycle cost per segment; a segment ends after each conditional branch.
+    seg_cost: Dict[int, int] = {}
+    seg_start, cost, cls = 0, 0, 0
+    for i, ins in enumerate(b.insns):
+        c, cls = _static_cost(ins, cls)
+        cost += c
+        if _is_cond_branch(ins):
+            seg_cost[seg_start] = cost
+            seg_start, cost = i + 1, 0
+    if seg_start < n:
+        seg_cost[seg_start] = cost
+
+    lines.append(f"{_bb_label(b.pc)}:;")
+    if b.loop_header:
+        lines.append(f"    VB_LEAN_YIELD_CHECK(cpu, 0x{b.pc:08X}u);")
+
+    loc: Dict[str, bool] = {k: False for k in _FLAG_NAMES}
+    cmp_valid = 0
+    for i, ins in enumerate(b.insns):
+        if i in seg_cost:
+            lines.append(f"    VB_LEAN_CHARGE(cpu, {seg_cost[i]});")
+        nxt = (ins.pc + max(ins.size, 2)) & 0xFFFFFFFF
+        text = texts[i]
+
+        if _is_bcond(ins):
+            if ins.mnemonic == "NOP":
+                continue
+            tgt = ins.branch_target & 0xFFFFFFFF
+            if tgt in lead:
+                act = f"goto {_bb_label(tgt)};"
+            else:
+                act = f"cpu->pc = 0x{tgt:08X}u; return;"
+            if ins.cond != 5 and tgt == b.pc and 0 in seg_cost \
+                    and not any(_is_cond_branch(x) for x in b.insns[:i]):
+                spin = _idle_spin_address(b.insns[:i])
+                if spin is not None:
+                    act = (f"VB_LEAN_IDLE_SPIN(cpu, "
+                           f"{seg_cost[0] + BCOND_TAKEN_EXTRA}, {spin}); {act}")
+            if ins.cond == 5:
+                lines.append(f"    VB_LEAN_CHARGE(cpu, {BCOND_TAKEN_EXTRA}); "
+                             f"{act}")
+            else:
+                expr = _cond_expr(ins.cond, loc, cmp_valid)
+                lines.append(f"    if ({expr}) {{ VB_LEAN_CHARGE(cpu, "
+                             f"{BCOND_TAKEN_EXTRA}); {act} }}")
+            continue
+        if _is_jr(ins):
+            tgt = ins.branch_target & 0xFFFFFFFF
+            if tgt in lead:
+                lines.append(f"    goto {_bb_label(tgt)};")
+            else:
+                lines.append(f"    cpu->pc = 0x{tgt:08X}u; return;")
+            continue
+        if _is_jal(ins):
+            tgt = ins.branch_target & 0xFFFFFFFF
+            if tgt in fn_starts:
+                lines.append(
+                    f"    cpu->gpr[31] = 0x{nxt:08X}u; cpu->pc = 0x{tgt:08X}u; "
+                    f"{_fn_symbol(tgt)}(cpu);")
+                lines.append(
+                    f"    if (cpu->pc != 0x{nxt:08X}u || cpu->yielded || "
+                    f"cpu->halted) {{ vb_dispatch_until(cpu, 0x{nxt:08X}u); "
+                    f"if (cpu->yielded || cpu->halted) return; }}")
+            else:
+                lines.append(f"    vb_dispatch_call(cpu, 0x{tgt:08X}u, "
+                             f"0x{nxt:08X}u);")
+                lines.append("    if (cpu->yielded || cpu->halted) return;")
+            continue
+        if _is_jmp(ins):
+            lines.append(f"    cpu->pc = cpu->gpr[{ins.reg1}] & 0xFFFFFFFEu; "
+                         f"return;")
+            continue
+
+        if not text:
+            continue
+        d = effects[i][0]
+        op = ins.opcode6
+        unpack = "vb_psw_unpack(" in text
+        is_cmp = (not ins.is_unknown and
+                  ((ins.fmt is Format.I and op in (0x02, 0x03)) or
+                   (ins.fmt is Format.II and op == 0x13)))
+        is_setf = (not ins.is_unknown and ins.fmt is Format.II
+                   and op == 0x12 and ins.reg2 != 0)
+        if is_setf:
+            # Reads flags inside a straight-line statement.
+            expr = _cond_expr(ins.imm5 & 0xF, loc, cmp_valid)
+            text = f"cpu->gpr[{ins.reg2}] = ({expr}) ? 1u : 0u;"
+        elif not unpack:
+            text = _rewrite_flags(text, live_after[i], mem_after[i])
+        if is_cmp:
+            text = text.replace("uint32_t _r=_a-_b; ",
+                                "uint32_t _r=_a-_b; lc_a=_a; lc_b=_b; ", 1)
+        for name in _FLAG_NAMES:
+            if d & _FLAG_BIT[name]:
+                loc[name] = not unpack
+        cmp_valid = ALL if is_cmp else (cmp_valid & ~d)
+
+        text = _BUS_RE.sub(
+            lambda m: f"VB_LEAN_{m.group(1).upper()}{m.group(2)}(cpu, ", text)
+
+        if not ins.is_unknown and ins.fmt is Format.II and op in (0x18, 0x1A):
+            text = text.replace("cpu->pc += 2;", f"cpu->pc = 0x{nxt:08X}u;", 1)
+        elif _is_div(ins):
+            text = text.replace(
+                "if (_b == 0) { vb_exception",
+                f"if (_b == 0) {{ cpu->pc = 0x{ins.pc:08X}u; vb_exception", 1)
+        elif _is_extended(ins):
+            text = f"cpu->pc = 0x{ins.pc:08X}u; " + text
+        elif _is_irq_window(ins):
+            text = text.replace(" cpu->cycle_deadline = cpu->cycles;", "")
+            text += f" VB_LEAN_IRQ_WINDOW(cpu, 0x{nxt:08X}u);"
+        lines.append(f"    {text}")
+
+
+def emit_function_lean(f: _Fn, fn_starts: Set[int], lv: "_Liveness") -> str:
+    start = f.rng.start_pc
+    lines: List[str] = []
+    lines.append(f"/* {_fn_symbol(start)}: 0x{start:08X}..0x{f.rng.end_pc:08X} */")
+    lines.append(f"void {_fn_symbol(start)}(CPUState* cpu) {{")
+    lines.append("    uint32_t lf_z=0, lf_s=0, lf_ov=0, lf_cy=0, lc_a=0, lc_b=0;")
+    others = sorted(p for p in f.leaders if p != start)
+    if others:
+        lines.append(f"    if (cpu->pc != 0x{start:08X}u) switch (cpu->pc) {{")
+        for p in others:
+            lines.append(f"    case 0x{p:08X}u: goto {_bb_label(p)};")
+        lines.append("    default: vb_interpreter_fallback(cpu); return;")
+        lines.append("    }")
+    else:
+        lines.append(f"    if (cpu->pc != 0x{start:08X}u) "
+                     f"{{ vb_interpreter_fallback(cpu); return; }}")
+    for b in f.blocks:
+        _emit_block(f, b, fn_starts, lv, lines)
+    if f.fell_off is not None:
+        lines.append(f"    vb_stub_abort_simple(\"fell off cart\", "
+                     f"0x{f.fell_off:08X}u);")
+    end = f.linear[-1].pc + max(f.linear[-1].size, 2)
+    lines.append(f"    cpu->pc = 0x{end & 0xFFFFFFFF:08X}u;")
+    lines.append("    return;")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def emit_bodies_lean(fns: List[_Fn], fn_starts: Set[int], lv: "_Liveness",
+                     module_name: str) -> str:
+    parts = [
+        "/* AUTOGENERATED by recompiler/v810/lean.py. DO NOT EDIT. */",
+        f"/* module: {module_name}    functions: {len(fns)}    mode: lean */",
+        "#include <stdint.h>",
+        '#include "cpu_state.h"',
+        '#include "interrupts.h"',
+        '#include "stub_abort.h"',
+        '#include "v810_interpreter.h"',
+        '#include "vb_lean.h"',
+        f'#include "{module_name}.h"',
+        "",
+    ]
+    for f in fns:
+        parts.append(emit_function_lean(f, fn_starts, lv))
+        parts.append("")
+    return "\n".join(parts)
+
+
+def emit_dispatch_lean(routes: Dict[int, int], module_name: str,
+                       rom_crc32: int) -> str:
+    p: List[str] = [
+        "/* AUTOGENERATED by recompiler/v810/lean.py. DO NOT EDIT. */",
+        f"/* module: {module_name}    routes: {len(routes)}    mode: lean */",
+        "#include <stdint.h>",
+        '#include "cpu_state.h"',
+        '#include "interrupts.h"',
+        '#include "stub_abort.h"',
+        '#include "v810_interpreter.h"',
+        '#include "vb_lean.h"',
+        f'#include "{module_name}.h"',
+        "",
+        "typedef void (*VbNativeFn)(CPUState*);",
+        "static const struct { uint32_t pc; VbNativeFn fn; } vb_routes[] = {",
+    ]
+    for pc, entry in sorted(routes.items()):
+        p.append(f"    {{0x{pc:08X}u, {_fn_symbol(entry)}}},")
+    p += [
+        "};",
+        "#define VB_ROUTE_COUNT (sizeof(vb_routes)/sizeof(vb_routes[0]))",
+        "/* Small direct-mapped cache in front of the binary search. */",
+        "static struct { uint32_t pc; VbNativeFn fn; } "
+        "vb_route_cache[VB_LEAN_ROUTE_CACHE];",
+        "static VbNativeFn vb_native_lookup(uint32_t pc) {",
+        "    unsigned slot = (pc >> 1) & (VB_LEAN_ROUTE_CACHE - 1);",
+        "    if (vb_route_cache[slot].pc == pc && vb_route_cache[slot].fn)",
+        "        return vb_route_cache[slot].fn;",
+        "    unsigned lo = 0, hi = VB_ROUTE_COUNT;",
+        "    while (lo < hi) { unsigned mid = lo + (hi - lo) / 2; "
+        "if (vb_routes[mid].pc < pc) lo = mid + 1; else hi = mid; }",
+        "    if (lo < VB_ROUTE_COUNT && vb_routes[lo].pc == pc) {",
+        "        vb_route_cache[slot].pc = pc; "
+        "vb_route_cache[slot].fn = vb_routes[lo].fn;",
+        "        return vb_routes[lo].fn;",
+        "    }",
+        "    return 0;",
+        "}",
+        "",
+        "/* Run until the guest returns to `stop_pc`, halts or yields.",
+        " * Non-call transfers set cpu->pc and return here, so guest loops",
+        " * never grow the C stack. */",
+        "static void vb_dispatch_loop(CPUState* cpu, uint64_t stop_pc) {",
+        "    while (cpu->pc != stop_pc && !cpu->halted && !cpu->yielded) {",
+        "        if (VB_LEAN_DEADLINE_HIT(cpu)) { cpu->yielded = 1; return; }",
+        "        if (vb_execution.mode == VB_EXEC_INTERPRETER) {",
+        "            vb_interpreter_step(cpu); continue;",
+        "        }",
+        "        VbNativeFn native = vb_native_lookup(cpu->pc);",
+        "        if (native) native(cpu);",
+        "        else vb_interpreter_fallback(cpu);",
+        "    }",
+        "}",
+        "",
+        "void vb_dispatch_until(CPUState* cpu, uint32_t stop_pc) {",
+        "    vb_dispatch_loop(cpu, stop_pc);",
+        "}",
+        "",
+        "void vb_dispatch_call(CPUState* cpu, uint32_t target_pc, uint32_t lp) {",
+        "    cpu->gpr[31] = lp;",
+        "    cpu->pc = target_pc;",
+        "    vb_dispatch_loop(cpu, lp);",
+        "}",
+        "",
+        "void vb_dispatch(CPUState* cpu, uint32_t target_pc) {",
+        "    cpu->pc = target_pc;",
+        "    vb_dispatch_loop(cpu, UINT64_MAX);",
+        "}",
+        "",
+        f"uint32_t vb_game_expected_crc32(void) "
+        f"{{ return 0x{rom_crc32 & 0xFFFFFFFF:08X}u; }}",
+    ]
+    return "\n".join(p)
+
+
+def select_lean_functions(rom: RomImage,
+                          ranges: List[FunctionRange]) -> List[FunctionRange]:
+    """Drop entries at odd PCs.  The V810 PC is always even, so these come
+    from data misread as code and can never be entered."""
+    return [r for r in ranges if not (r.start_pc & 1)]
+
+
+def recompile_rom_lean(rom: RomImage, *, module_name: str = "cart",
+                       extra_seeds: Optional[Iterable[int]] = None,
+                       extra_leaders: Optional[Iterable[int]] = None,
+                       unit_instruction_limit: Optional[int] = None
+                       ) -> CodegenResult:
+    """Lean counterpart of `emitter.recompile_rom`."""
+    if unit_instruction_limit is not None and unit_instruction_limit < 1:
+        raise ValueError("unit_instruction_limit must be positive or None")
+    ranges = discover_functions(rom, extra_seeds=extra_seeds)
+    ranges = select_lean_functions(rom, ranges)
+    if not ranges:
+        return CodegenResult(files={}, function_count=0, instruction_count=0)
+    fns, routes = _build(rom, ranges, extra_leaders)
+    lv = _Liveness(fns, routes)
+    lv.solve()
+    fn_starts = {f.rng.start_pc for f in fns}
+
+    units: List[List[_Fn]] = []
+    pending: List[_Fn] = []
+    count = total = 0
+    for f in fns:
+        n = len(f.linear)
+        total += n
+        if (unit_instruction_limit is not None and pending
+                and count + n > unit_instruction_limit):
+            units.append(pending)
+            pending, count = [], 0
+        pending.append(f)
+        count += n
+    if pending:
+        units.append(pending)
+
+    crc = zlib.crc32(rom.data) & 0xFFFFFFFF
+    files = {
+        f"generated/{module_name}_dispatch.c":
+            emit_dispatch_lean(routes, module_name, crc),
+        f"generated/{module_name}.h":
+            emit_header([f.rng for f in fns], module_name).replace(
+                "#ifdef __cplusplus\nextern \"C\" {\n#endif\n",
+                "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+                "void vb_dispatch_until(CPUState* cpu, uint32_t stop_pc);\n", 1),
+    }
+    sources = []
+    for index, unit in enumerate(units):
+        suffix = "full" if index == 0 else f"part_{index:03d}"
+        name = f"{module_name}_{suffix}.c"
+        sources.append(name)
+        files[f"generated/{name}"] = emit_bodies_lean(unit, fn_starts, lv,
+                                                      module_name)
+    files[f"generated/{module_name}_sources.cmake"] = (
+        "# Generated by vbrecomp; do not edit.\nset(VB_GENERATED_BODY_SOURCES\n"
+        + "".join(f'    "{name}"\n' for name in sources) + ")\n")
+    return CodegenResult(files=files, function_count=len(fns),
+                         instruction_count=total)

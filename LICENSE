@@ -20,6 +20,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Files under vbrecomp/ and tools/vbrecomp-lean.patch are derived from
+Files under vbrecomp/ and tools/vbrecomp/ are derived from
 mstan/vbrecomp and remain under its MIT license (vbrecomp/LICENSE).
 Mario's Tennis is (c) 1995 Nintendo. This repository contains no ROM data.

@@ -23,18 +23,21 @@ with random input).
 
 ## Building
 
-1. Install [devkitPro](https://devkitpro.org/wiki/Getting_Started) with
-   "NDS Development", and Python 3.10+.
-2. Generate the recompiled game code from your ROM (this repo does not
-   ship it, because it is derived from the ROM):
-   ```
-   tools/regenerate.sh path/to/marios_tennis.vb
-   ```
-   Run it from the devkitPro MSYS2 shell on Windows.
-3. Copy your ROM to `nitrofiles/marios_tennis.vb`.
-4. Run `make` (or double-click `build.bat` on Windows).
+You need, once:
+- [devkitPro](https://devkitpro.org/wiki/Getting_Started) with "NDS Development"
+- [Python](https://www.python.org/downloads/) 3.10 or newer (tick "Add
+  python.exe to PATH" when installing)
 
-The result, `mariotennis-ds.nds`, contains your ROM. Do not share it.
+Then:
+1. Put your ROM in this folder. A `.vb` file or a `.zip` containing it both
+   work, and the name does not matter.
+2. Double-click `build.bat`.
+
+It finds and checks the ROM, generates the recompiled game code from it,
+and builds `mariotennis-ds.nds`. That file contains your ROM, so do not
+share it.
+
+On Linux or macOS, run `python3 tools/generate.py` and then `make`.
 
 ## Controls
 
@@ -48,9 +51,9 @@ The result, `mariotennis-ds.nds`, contains your ROM. Do not share it.
 
 ## How it works
 
-- `tools/vbrecomp-lean.patch` adds a `--lean` mode to the
-  [vbrecomp](https://github.com/mstan/vbrecomp) recompiler (at `8e8d3c6`).
-  The stock output is cycle-exact and about 6 MB for the DS's CPU; lean
+- `tools/vbrecomp/` is the [vbrecomp](https://github.com/mstan/vbrecomp)
+  recompiler (at `8e8d3c6`) with an added `--lean` mode (`lean.py`), and
+  `tools/generate.py` runs it on your ROM.  The stock output is cycle-exact and about 6 MB for the DS's CPU; lean
   output is about 0.5 MB. It charges cycles per block instead of per
   instruction, drops flag updates nothing reads, and marks wait loops so
   the runtime can skip them.
