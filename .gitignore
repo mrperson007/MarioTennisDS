@@ -1,0 +1,12 @@
+# Build output (the .nds contains your ROM: never commit it)
+build/
+*.nds
+*.elf
+*.map
+build.log
+host/vbds-*
+
+# Your ROM and code generated from it stay local
+nitrofiles/*.vb
+roms/
+generated-lean/
