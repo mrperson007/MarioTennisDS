@@ -23,6 +23,17 @@ void vbds_fatal(const char* what, uint32_t pc, uint32_t addr) {
     exit(3);
 }
 
+#include "vbds_vsu.h"
+static FILE *s_vsulog, *s_vsuraw;
+static void vsu_trace(int kind, uint32_t a, uint32_t b) { fprintf(s_vsulog, "%c %u %u\n", kind ? 'W' : 'T', a, b); }
+static void vsu_raw(int l, int r) { int16_t v[2] = { (int16_t)l, (int16_t)r }; fwrite(v, 2, 2, s_vsuraw); }
+
+#include <time.h>
+static uint32_t host_ticks(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000000000ull + ts.tv_nsec);
+}
+
 static void apply_script(const char* script, uint32_t frame) {
     for (const char* p = script; p && *p;) {
         unsigned f = 0, m = 0, h = 0; int n = 0;
@@ -54,10 +65,35 @@ int main(int argc, char** argv) {
     FILE* shown_f = getenv("VB_TEST_SHOWN") ? fopen(getenv("VB_TEST_SHOWN"), "w") : NULL;
     static uint8_t shown[256 * 224];
 
+    /* Sound: VB_TEST_VSULOG (tick / write trace), VB_TEST_VSURAW (raw mix
+     * per sample), VB_TEST_WAV (the filtered output as a .wav file). */
+    if (getenv("VB_TEST_VSULOG")) { s_vsulog = fopen(getenv("VB_TEST_VSULOG"), "w"); vbds_vsu_trace = vsu_trace; }
+    if (getenv("VB_TEST_VSURAW")) { s_vsuraw = fopen(getenv("VB_TEST_VSURAW"), "wb"); vbds_vsu_raw_hook = vsu_raw; }
+    FILE* wav = getenv("VB_TEST_WAV") ? fopen(getenv("VB_TEST_WAV"), "wb") : NULL;
+    uint32_t wav_samples = 0;
+    if (wav) fseek(wav, 44, SEEK_SET);
+
+    /* VB_TEST_FRAMEPROF=N: every N frames print time per frame (us) for
+     * the frame, drawing and game code, and blocks drawn. */
+    unsigned fp_every = getenv("VB_TEST_FRAMEPROF") ? (unsigned)atoi(getenv("VB_TEST_FRAMEPROF")) : 0;
+    uint32_t fp_t = 0, fp_total = 0;
+    if (fp_every) vbds_tick_source = host_ticks;
+
     uint32_t frames = (uint32_t)strtoul(argv[2], NULL, 10);
     const char* script = getenv("VB_TEST_INPUT");
     while (vbds_cpu.frame < frames) {
+        if (fp_every) fp_t = host_ticks();
         vbds_run_frame();
+        if (fp_every) {
+            fp_total += host_ticks() - fp_t;
+            if (vbds_cpu.frame % fp_every == 0) {
+                printf("F %u total %u draw %u game %u blocks %u\n", vbds_cpu.frame,
+                       fp_total / fp_every / 1000, vbds_prof_draw_ticks / fp_every / 1000,
+                       vbds_prof_game_ticks / fp_every / 1000, vbds_prof_blocks_drawn / fp_every);
+                fp_total = 0; vbds_prof_draw_ticks = vbds_prof_game_ticks = 0;
+                vbds_prof_blocks_drawn = vbds_prof_blocks_skipped = 0;
+            }
+        }
         if (check_pages) {
             int slot = vbds_vip_display_slot();
             if (vbds_vip_page_stale(slot)) vbds_vip_refresh_page(slot);
@@ -76,9 +112,23 @@ int main(int argc, char** argv) {
                 }
             page_checks++; page_bad += bad;
         }
+        {
+            const int16_t *al, *ar;
+            unsigned an = vbds_vsu_take(&al, &ar);
+            for (unsigned i = 0; wav && i < an; i++) { int16_t v[2] = { al[i], ar[i] }; fwrite(v, 2, 2, wav); }
+            wav_samples += an;
+        }
         if (shown_f) {
             int slot = vbds_vip_display_slot();
-            if (vbds_vip_take_dirty()) {
+            /* VB_TEST_HOLD=N: like the DS start-up skip, show nothing (and
+             * drop the change flag) for the first N frames. */
+            static long hold = -1;
+            if (hold < 0) hold = getenv("VB_TEST_HOLD") ? atol(getenv("VB_TEST_HOLD")) : 0;
+            if ((long)vbds_cpu.frame < hold) {
+                /* Pages must still be brought up to date as they would be. */
+                if (vbds_vip_take_dirty() && vbds_vip_page_stale(slot)) vbds_vip_refresh_page(slot);
+            }
+            else if (vbds_vip_take_dirty() || (long)vbds_cpu.frame == hold) {
                 if (vbds_vip_page_stale(slot)) vbds_vip_refresh_page(slot);
                 memcpy(shown, pages[slot], sizeof(shown));
             }
@@ -89,6 +139,19 @@ int main(int argc, char** argv) {
         apply_script(script, vbds_cpu.frame);
     }
     if (shown_f) fclose(shown_f);
+    if (s_vsulog) fclose(s_vsulog);
+    if (s_vsuraw) fclose(s_vsuraw);
+    if (wav) {
+        uint32_t bytes = wav_samples * 4u, rate = 16364, v32;
+        fseek(wav, 0, SEEK_SET);
+        fwrite("RIFF", 1, 4, wav); v32 = 36 + bytes; fwrite(&v32, 4, 1, wav);
+        fwrite("WAVEfmt ", 1, 8, wav); v32 = 16; fwrite(&v32, 4, 1, wav);
+        uint16_t fmt[2] = { 1, 2 }; fwrite(fmt, 2, 2, wav);
+        fwrite(&rate, 4, 1, wav); v32 = rate * 4u; fwrite(&v32, 4, 1, wav);
+        uint16_t blk[2] = { 4, 16 }; fwrite(blk, 2, 2, wav);
+        fwrite("data", 1, 4, wav); fwrite(&bytes, 4, 1, wav);
+        fclose(wav);
+    }
 
     if (getenv("VB_TEST_CHECK_PAGES"))
         printf("page checks %lu, mismatches %lu\n", page_checks, page_bad);

@@ -9,12 +9,24 @@ small-footprint runtime.
 
 ## Status
 
-- Boots, shows the warning and title screens, and plays a match in melonDS.
--It runs at 100% speed now in Melonds
+- Full speed in melonDS; plays well on a DS Lite, with occasional
+  slowdown at busy moments.
+- Sound (all six Virtual Boy sound channels) at 16 kHz stereo.
+- Starts straight at the intro: the precaution and alignment screens are
+  skipped and automatic pause is turned off.
 - Left eye only, reduced from 384x224 to 256x149 with averaging so small
   text stays readable.
-- Full sound.
-- Works on real hardware.
+
+## Settings
+
+Tap a setting on the bottom screen to change it. With an SD card, settings
+are saved to `mariotennis.cfg` in its root.
+
+- Colour: red, grey, green (Game Boy style), amber, blue
+- Brightness: dim, normal, bright, brightest
+- Screen: smooth (two blended layers) or sharp (one layer)
+- Volume: off, 25%, 50%, 75%, 100%
+- Stats: speed and CPU figures
 
 The game logic is checked against the original PC runtime: work RAM and
 the picture are byte-identical in every test session (up to 12,000 frames
@@ -59,7 +71,7 @@ On Linux or macOS, run `python3 tools/generate.py` and then `make`.
 - `core/` is the runtime: memory map and scheduler (`vbds_bus.c`,
   `vbds_core.c`), a compact video chip (`vbds_vip.c`, from vbrecomp's port
   of Beetle VB, with redraw skipping for unchanged areas), the 2/3
-  downscaler (`vbds_scale.c`) and a silent sound stub.
+  downscaler (`vbds_scale.c`) and the sound chip (`vbds_vsu.c`).
 - `source/main_nds.c` is the DS front end.
 - `vbrecomp/` holds unmodified CPU, timer, pad and interrupt files from
   vbrecomp.

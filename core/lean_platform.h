@@ -5,6 +5,14 @@
 
 #include "vbds.h"
 
+/* The hottest game functions (tools/generate.py HOT_FUNCTIONS): ARM code
+ * in the instruction TCM on the DS, where the rest is Thumb in main RAM. */
+#if defined(ARM9) && !defined(VBDS_NO_ITCM)
+#define VBDS_HOT_FN __attribute__((section(".itcm"), target("arm")))
+#else
+#define VBDS_HOT_FN
+#endif
+
 /* Guest memory access from recompiled code.  Work RAM (region 5) and ROM
  * (region 7) have no side effects, so they are read and written inline;
  * everything else goes through the bus functions. */

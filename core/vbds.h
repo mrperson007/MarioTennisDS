@@ -43,9 +43,13 @@ const uint8_t* vbds_wram(void);
 #if defined(ARM9) && !defined(VBDS_NO_ITCM)
 #define VBDS_FAST      __attribute__((section(".itcm"), long_call, noinline))
 #define VBDS_FAST_DECL __attribute__((long_call))
+/* Zero-initialised data in the 16 KB data TCM (shared with the stack):
+ * single-cycle access that never competes for the 4 KB data cache. */
+#define VBDS_DTCM_BSS  __attribute__((section(".sbss")))
 #else
 #define VBDS_FAST
 #define VBDS_FAST_DECL
+#define VBDS_DTCM_BSS
 #endif
 
 /* Guest bus. */

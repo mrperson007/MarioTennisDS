@@ -34,6 +34,11 @@
  * renderer may read DRAM as uint16_t. */
 static uint32_t s_low_store[VIP_LOW_SIZE / 4];
 static uint16_t s_chr[VIP_CHR_SIZE / 2];
+/* The same characters stored row-major: s_chr_rows[y][c] is row y of
+ * character c.  A picture row reads row y of many characters, which here
+ * share cache lines (16 per line instead of 2) - this matters on the DS,
+ * whose data cache is 4 KB. */
+static uint16_t s_chr_rows[8][VIP_CHR_SIZE / 16];
 static uint8_t  s_unmapped[4];
 #define s_low ((uint8_t*)s_low_store)
 
@@ -166,11 +171,13 @@ static uint32_t oam_blocks(uint32_t y) {
 static inline int16_t sign_11(uint32_t v);
 /* Blocks inside a world's window. */
 static uint32_t world_blocks(const uint16_t* wp) {
-    uint16_t gy = (uint16_t)sign_11(wp[3]);
-    uint32_t h = wp[8] & 0x3FFu, m = 0;
-    for (uint32_t r = 0; r < 224u; r++)
-        if ((uint16_t)(r - gy) <= h) m |= 1u << (r >> 3);
-    return m;
+    /* Rows r with (uint16_t)(r - gy) <= h, i.e. gy <= r <= gy + h. */
+    int32_t lo = sign_11(wp[3]), hi = lo + (int32_t)(wp[8] & 0x3FFu);
+    if (lo < 0) lo = 0;
+    if (hi > 223) hi = 223;
+    if (lo > hi) return 0;
+    uint32_t first = (uint32_t)lo >> 3, last = (uint32_t)hi >> 3;
+    return (uint32_t)((((uint64_t)2 << last) - 1u) & ~((1u << first) - 1u));
 }
 static void row_sig_add(uint32_t mask, uint32_t d) {
     for (; mask; mask &= mask - 1) s_row_sig[__builtin_ctz(mask)] += d;
@@ -234,7 +241,7 @@ int vbds_vip_take_dirty(void) { int d = s_dirty; s_dirty = 0; return d; }
 static uint8_t* s_page[2];
 static int      s_page_stride;
 static uint8_t  s_page_stale[2];
-static uint16_t s_hpair[64];            /* (a<<4|b<<2|c) -> out0 | out1 << 8 */
+VBDS_DTCM_BSS static uint16_t s_hpair[64];   /* (a<<4|b<<2|c) -> out0 | out1 << 8 */
 
 static void page_init_tables(void) {
     for (int i = 0; i < 64; i++) {
@@ -252,10 +259,12 @@ VBDS_FAST static void page_row(const uint8_t* src, uint8_t* dst) {
     uint32_t* out = (uint32_t*)dst;
     for (int i = 0; i < 32; i++, in += 3, out += 2) {
         uint32_t w0 = in[0], w1 = in[1], w2 = in[2];
-        uint32_t t0 = ((w0 << 4) & 0x30u) | ((w0 >> 6) & 0x0Cu) | ((w0 >> 16) & 3u);
-        uint32_t t1 = ((w0 >> 20) & 0x30u) | ((w1 << 2) & 0x0Cu) | ((w1 >> 8) & 3u);
+        /* Pixels are bytes 0..3, so one multiply gathers three of them
+         * (a<<4 | b<<2 | c lands in bits 16..21; nothing else does). */
+        uint32_t t0 = ((w0 * 0x100401u) >> 16) & 63u;
+        uint32_t t1 = ((w0 >> 20) & 0x30u) | (((w1 * 0x40100u) >> 16) & 15u);
         uint32_t t2 = ((w1 >> 12) & 0x30u) | ((w1 >> 22) & 0x0Cu) | (w2 & 3u);
-        uint32_t t3 = ((w2 >> 4) & 0x30u) | ((w2 >> 14) & 0x0Cu) | ((w2 >> 24) & 3u);
+        uint32_t t3 = (((w2 >> 8) * 0x100401u) >> 16) & 63u;
         out[0] = s_hpair[t0] | ((uint32_t)s_hpair[t1] << 16);
         out[1] = s_hpair[t2] | ((uint32_t)s_hpair[t3] << 16);
     }
@@ -306,8 +315,8 @@ void vbds_vip_refresh_page(int slot) {
 /* Background tile rows, four pixels at a time: for a byte of 2-bit pixels,
  * s_bg4[palette][byte] holds the four palette-mapped values and
  * s_bg4_opaque[byte] a bit per non-zero pixel. */
-static uint32_t s_bg4[4][256];
-static uint8_t  s_bg4_opaque[256];
+VBDS_DTCM_BSS static uint32_t s_bg4[4][256];
+VBDS_DTCM_BSS static uint8_t  s_bg4_opaque[256];
 
 static void recalc_gplt_cache(int which) {
     for (int i = 0; i < 4; ++i)
@@ -371,7 +380,7 @@ static void vip_check_irq(void) {
 }
 
 /* s_rev2bpp[b]: the four 2-bit pixels of byte b in reverse order. */
-static uint8_t s_rev2bpp[256];
+VBDS_DTCM_BSS static uint8_t s_rev2bpp[256];
 
 static void vip_draw_block_now(uint8_t block_no);
 
@@ -382,6 +391,7 @@ void vb_vip_init(void) {
     }
     memset(s_low_store, 0, sizeof(s_low_store));
     memset(s_chr, 0, sizeof(s_chr));
+    memset(s_chr_rows, 0, sizeof(s_chr_rows));
     s_intpnd = 0; s_intenb = 0;
     s_dpctrl = DPCTRL_DISP;
     s_xpctrl = 0; s_sbcmp = 0; s_frmcyc = 0; s_bkcol = 0;
@@ -717,41 +727,58 @@ VBDS_FAST static void vip_store(uint32_t o, uint32_t v, unsigned width) {
         /* Maps, parameter tables, world attributes, sprite attributes. */
         const int oam = o >= 0x3E000u, world = o >= 0x3D800u && o < 0x3DC00u;
         uint16_t* h = (uint16_t*)&s_low[o & ~1u];
-        uint16_t* ent = (uint16_t*)&s_low[oam ? (o & ~7u) : (o & ~31u)];
-        const uint32_t ekey = (oam ? 0x40000u : 0x50000u) + (uint32_t)(ent - (uint16_t*)s_low);
-        const unsigned ewords = oam ? 4u : 16u;
-        uint32_t emask_old = 0, ehash_old = 0;
-        if (oam || world) {
+        const unsigned nh = width == 4 ? 2u : 1u;
+        uint32_t hw_old[2] = { h[0], nh == 2 ? h[1] : 0 };
+        uint16_t* ent = 0;
+        uint32_t ekey = 0, emask_old = 0, w0_old = 0;
+        unsigned ewords = 0;
+        if (oam | world) {
+            ent = (uint16_t*)&s_low[oam ? (o & ~7u) : (o & ~31u)];
+            ekey = (oam ? 0x40000u : 0x50000u) + (uint32_t)(ent - (uint16_t*)s_low);
+            ewords = oam ? 4u : 16u;
             emask_old = oam ? oam_blocks(ent[2]) : world_blocks(ent);
-            for (unsigned i = world; i < ewords; i++) ehash_old += ent[i] * sig_key(ekey + i);
+            w0_old = ent[0];
         }
-        uint32_t w0_old = ent[0];
-        uint32_t hw_old[2] = { h[0], width == 4 ? h[1] : 0 };
         for (unsigned i = 0; i < width; i++) p[i] = (uint8_t)(v >> (i * 8));
-        /* Page and segment signatures, per halfword written. */
+        /* Page and segment signatures (and the entry's), per halfword. */
         uint32_t page = (o - 0x20000u) >> 7, seg = (o - 0x20000u) >> 13;
-        for (unsigned i = 0; i < (width == 4 ? 2u : 1u); i++) {
-            uint32_t d = (uint32_t)(h[i] - hw_old[i]) * sig_key((o >> 1) + i);
-            s_page_sig[page] += d;
-            s_seg_sig[seg] += d;
+        uint32_t edelta = 0;
+        for (unsigned i = 0; i < nh; i++) {
+            uint32_t d = (uint32_t)(h[i] - hw_old[i]);
+            if (!d) continue;
+            uint32_t pd = d * sig_key((o >> 1) + i);
+            s_page_sig[page] += pd;
+            s_seg_sig[seg] += pd;
+            if (ent) {
+                unsigned idx = (unsigned)(h + i - ent);
+                if (idx >= (unsigned)world) edelta += d * sig_key(ekey + idx);
+            }
         }
         s_map_stamp = ++s_clock;
-        if (oam || world) {
+        if (ent) {
             if (world && ent[0] != w0_old)
                 sig_update(SIG_KEY_REG + 0x200 + (uint32_t)(ent - (uint16_t*)&s_low[0x3D800u]),
                            w0_old, ent[0]);
-            uint32_t ehash = 0;
-            for (unsigned i = world; i < ewords; i++) ehash += ent[i] * sig_key(ekey + i);
-            row_sig_add(emask_old, 0u - ehash_old);
-            row_sig_add(oam ? oam_blocks(ent[2]) : world_blocks(ent), ehash);
+            uint32_t emask = oam ? oam_blocks(ent[2]) : world_blocks(ent);
+            if (emask == emask_old) {
+                row_sig_add(emask, edelta);
+            } else {
+                uint32_t ehash = 0;
+                for (unsigned i = world; i < ewords; i++) ehash += ent[i] * sig_key(ekey + i);
+                row_sig_add(emask_old, 0u - (ehash - edelta));
+                row_sig_add(emask, ehash);
+            }
         }
     } else if (kind == 2 && p >= (uint8_t*)s_chr && p < (uint8_t*)s_chr + VIP_CHR_SIZE) {
         uint32_t off = (uint32_t)(p - (uint8_t*)s_chr) & ~1u;
         uint16_t* h = (uint16_t*)((uint8_t*)s_chr + off);
         uint32_t hw_old[2] = { h[0], width == 4 ? h[1] : 0 };
         for (unsigned i = 0; i < width; i++) p[i] = (uint8_t)(v >> (i * 8));
-        for (unsigned i = 0; i < (width == 4 ? 2u : 1u); i++)
+        for (unsigned i = 0; i < (width == 4 ? 2u : 1u); i++) {
+            uint32_t oi = off + 2u * i;
+            s_chr_rows[(oi >> 1) & 7u][oi >> 4] = h[i];
             s_chr_sig[off >> 10] += (uint32_t)(h[i] - hw_old[i]) * sig_key(0x60000u + (off >> 1) + i);
+        }
         s_chr_stamp = ++s_clock;
     } else if (kind == 2) {
         /* Key on the storage location so every alias of character RAM
@@ -854,8 +881,12 @@ VBDS_FAST void vb_vip_write32(uint32_t addr, uint32_t v) {
 #define PAD_LEFT   8
 
 static int s_obj_search_which;
-static uint32_t s_row_store[2][8 * ROW_STRIDE / 4];    /* word-aligned */
-#define s_row_buf ((uint8_t (*)[8 * ROW_STRIDE])s_row_store)
+/* Rows of the block being drawn, one byte per pixel.  The left eye's (the
+ * one shown on the DS) lives in the data TCM. */
+VBDS_DTCM_BSS static uint32_t s_row_l[8 * ROW_STRIDE / 4];
+static uint32_t s_row_r[8 * ROW_STRIDE / 4];
+static uint32_t* const s_row_store[2] = { s_row_l, s_row_r };
+static uint8_t* const s_row_buf[2] = { (uint8_t*)s_row_l, (uint8_t*)s_row_r };
 
 #define dram_u16() ((const uint16_t*)&s_low[0x20000u])
 
@@ -869,7 +900,6 @@ VBDS_FAST static void draw_bg(uint8_t* target, uint16_t real_y,
                     uint32_t scx, uint32_t scy,
                     uint16_t dest_x, uint16_t dest_y,
                     uint16_t dest_width, uint16_t dest_height) {
-    const uint16_t* chr = s_chr;
     const uint16_t* bgm = dram_u16();
     uint32_t bgmap_base = (uint32_t)bgmap_base_raw << 12;
     int32_t start_x, final_x;
@@ -917,7 +947,7 @@ VBDS_FAST static void draw_bg(uint8_t* target, uint16_t real_y,
         uint32_t char_sub_y = vflip_xor ^ ((uint32_t)source_y & 0x7u);
 
         if (!(source_x_u & 7u) && (x + 7) <= final_x) {
-            uint32_t pixels = chr[char_no * 8u + char_sub_y];
+            uint32_t pixels = s_chr_rows[char_sub_y][char_no];
             if (pixels) {
                 if (bgsc & 0x2000u)
                     pixels = (uint32_t)(s_rev2bpp[pixels & 0xFFu] << 8) | s_rev2bpp[pixels >> 8];
@@ -926,8 +956,12 @@ VBDS_FAST static void draw_bg(uint8_t* target, uint16_t real_y,
                 for (int half = 0; half < 2; half++, t += 4, pixels >>= 8) {
                     uint32_t b = pixels & 0xFFu, m = s_bg4_opaque[b], w = lut[b];
                     if (m == 0xFu) {
-                        t[0] = (uint8_t)w; t[1] = (uint8_t)(w >> 8);
-                        t[2] = (uint8_t)(w >> 16); t[3] = (uint8_t)(w >> 24);
+                        if (!((uintptr_t)t & 3u)) {
+                            *(uint32_t*)(void*)t = w;          /* little-endian */
+                        } else {
+                            t[0] = (uint8_t)w; t[1] = (uint8_t)(w >> 8);
+                            t[2] = (uint8_t)(w >> 16); t[3] = (uint8_t)(w >> 24);
+                        }
                     } else if (m) {
                         if (m & 1u) t[0] = (uint8_t)w;
                         if (m & 2u) t[1] = (uint8_t)(w >> 8);
@@ -940,7 +974,7 @@ VBDS_FAST static void draw_bg(uint8_t* target, uint16_t real_y,
             source_x += 8;
         } else {
             uint32_t char_sub_x = hflip_xor ^ (source_x_u & 0x7u);
-            uint32_t pixel = (chr[char_no * 8u + char_sub_y] >> (char_sub_x * 2u)) & 0x3u;
+            uint32_t pixel = (s_chr_rows[char_sub_y][char_no] >> (char_sub_x * 2u)) & 0x3u;
             if (pixel) target[x] = pal[pixel];
             source_x++;
         }
@@ -954,7 +988,6 @@ VBDS_FAST static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
                         uint32_t scx, uint32_t scy,
                         uint16_t dest_x, uint16_t dest_y,
                         uint16_t dest_width, uint16_t dest_height) {
-    const uint16_t* chr = s_chr;
     const uint16_t* bgm = dram_u16();
     const uint32_t source_x_size = 512u << scx;
     const uint32_t source_y_size = 512u << scy;
@@ -1042,18 +1075,25 @@ VBDS_FAST static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
                 bgsc = bgm[(bgmap_base | ((sx >> 6) & ~0xFFFu)
                            | ((sx >> 12) & 0x3Fu)) & 0xFFFFu];
             used |= 1u << ((bgsc & 0x7FFu) >> 6);
-            uint32_t row = chr[((bgsc & 0x7FFu) * 8u)
-                               | (((bgsc & 0x1000u) ? 7u : 0u) ^ sub_y)];
+            uint32_t row = s_chr_rows[((bgsc & 0x1000u) ? 7u : 0u) ^ sub_y][bgsc & 0x7FFu];
             if (row) {
                 if (bgsc & 0x2000u)
                     row = (uint32_t)(s_rev2bpp[row & 0xFFu] << 8) | s_rev2bpp[row >> 8];
                 const uint8_t* pal = s_gplt_cache[bgsc >> 14];
                 uint32_t p = sx;
                 uint8_t* t = target + x;
-                for (int k = 0; k < n; k++) {
-                    uint32_t v = (row >> ((p >> 8) & 0xEu)) & 0x3u;
-                    if (v) t[k] = pal[v];
-                    p += (uint32_t)dx;
+                if (((row | (row >> 1)) & 0x5555u) == 0x5555u) {
+                    /* No transparent pixel in this cell row: look up the 8
+                     * colours once, then store without testing. */
+                    uint8_t e[8];
+                    for (int j = 0; j < 8; j++) e[j] = pal[(row >> (2 * j)) & 3u];
+                    for (int k = 0; k < n; k++) { t[k] = e[(p >> 9) & 7u]; p += (uint32_t)dx; }
+                } else {
+                    for (int k = 0; k < n; k++) {
+                        uint32_t v = (row >> ((p >> 8) & 0xEu)) & 0x3u;
+                        if (v) t[k] = pal[v];
+                        p += (uint32_t)dx;
+                    }
                 }
             }
             x += n;
@@ -1079,7 +1119,7 @@ VBDS_FAST static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
             uint32_t char_sub_y = vflip_xor ^ ((source_y >> 9) & 0x7u);
             uint32_t char_sub_x = hflip_xor ^ ((source_x >> 9) & 0x7u);
             s_cur_chr |= 1u << ((bgsc & 0x7FFu) >> 6);
-            uint32_t pixel = (chr[(bgsc & 0x7FFu) * 8u + char_sub_y] >> (char_sub_x * 2u)) & 0x3u;
+            uint32_t pixel = (s_chr_rows[char_sub_y][bgsc & 0x7FFu] >> (char_sub_x * 2u)) & 0x3u;
             if (pixel) target[x] = s_gplt_cache[bgsc >> 14][pixel];
             source_x = (uint32_t)((int32_t)source_x + dx);
             source_y = (uint32_t)((int32_t)source_y + dy);
@@ -1088,7 +1128,6 @@ VBDS_FAST static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
 }
 
 VBDS_FAST static void draw_obj(uint8_t* fb_lr[2], uint16_t y, const int lron[2]) {
-    const uint16_t* chr = s_chr;
     const uint16_t* bgm = dram_u16();
     int32_t start_oam = s_spt[s_obj_search_which];
     int32_t end_oam   = s_obj_search_which ? s_spt[s_obj_search_which - 1] : 1023;
@@ -1102,7 +1141,7 @@ VBDS_FAST static void draw_obj(uint8_t* fb_lr[2], uint16_t y, const int lron[2])
         uint32_t attr = oam_ptr[3];
         s_cur_chr |= 1u << ((attr & 0x7FFu) >> 6);
         uint32_t char_sub_y = ((attr & 0x1000u) ? 7u : 0u) ^ tile_y;
-        uint32_t pixels_save = chr[(attr & 0x7FFu) * 8u + char_sub_y];
+        uint32_t pixels_save = s_chr_rows[char_sub_y][attr & 0x7FFu];
         if (!pixels_save) continue;
 
         uint32_t jx = oam_ptr[0];

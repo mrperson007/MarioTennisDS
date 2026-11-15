@@ -22,7 +22,15 @@ sys.path.insert(0, os.path.join(HERE, "vbrecomp"))
 
 ROM_CRC = 0x7CE7460D
 ROM_SIZE = 524288
-GEN_VERSION = "lean-1"          # bump when the recompiler changes
+GEN_VERSION = "lean-2"          # bump when the recompiler or marking changes
+
+# The game functions that take the most time (measured over several play
+# sessions).  On the DS they are compiled as ARM code into the fast
+# instruction memory (VBDS_HOT_FN in core/lean_platform.h); about 9 KB.
+HOT_FUNCTIONS = [
+    "FFF838E4", "FFF8135C", "FFF841C2", "FFF9242A",
+    "FFF80186", "FFF801B2", "FFF80144", "FFF8016C",
+]
 OUT_DIR = os.path.join(ROOT, "generated-lean")
 ROM_DEST = os.path.join(ROOT, "nitrofiles", "marios_tennis.vb")
 STAMP = os.path.join(OUT_DIR, "generated.stamp")
@@ -98,6 +106,9 @@ def main():
         name = os.path.basename(rel)
         if name.endswith(".cmake"):
             continue
+        for addr in HOT_FUNCTIONS:
+            text = text.replace(f"\nvoid vb_fn_{addr}(CPUState* cpu) {{",
+                                f"\nVBDS_HOT_FN void vb_fn_{addr}(CPUState* cpu) {{")
         with open(os.path.join(OUT_DIR, name), "w", newline="\n") as f:
             f.write(text)
     with open(STAMP, "w") as f:
