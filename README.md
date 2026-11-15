@@ -10,12 +10,11 @@ small-footprint runtime.
 ## Status
 
 - Boots, shows the warning and title screens, and plays a match in melonDS.
-- **Too slow to play yet:** about 34% of full speed during a rally on an
-  original DS. The bottom screen shows live speed and CPU figures.
+-It runs at 100% speed now in Melonds
 - Left eye only, reduced from 384x224 to 256x149 with averaging so small
   text stays readable.
 - No sound yet.
-- Not yet tried on real hardware.
+- Works on real hardware.
 
 The game logic is checked against the original PC runtime: work RAM and
 the picture are byte-identical in every test session (up to 12,000 frames
