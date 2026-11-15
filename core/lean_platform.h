@@ -5,13 +5,49 @@
 
 #include "vbds.h"
 
-/* Call the bus directly instead of through CPUState function pointers. */
-#define VB_LEAN_READ8(cpu, a)      vb_read8(a)
-#define VB_LEAN_READ16(cpu, a)     vb_read16(a)
-#define VB_LEAN_READ32(cpu, a)     vb_read32(a)
-#define VB_LEAN_WRITE8(cpu, a, v)  vb_write8((a), (v))
-#define VB_LEAN_WRITE16(cpu, a, v) vb_write16((a), (v))
-#define VB_LEAN_WRITE32(cpu, a, v) vb_write32((a), (v))
+/* Guest memory access from recompiled code.  Work RAM (region 5) and ROM
+ * (region 7) have no side effects, so they are read and written inline;
+ * everything else goes through the bus functions. */
+typedef uint16_t vbds_u16a __attribute__((may_alias));
+typedef uint32_t vbds_u32a __attribute__((may_alias));
+
+static inline uint8_t vbds_r8(uint32_t a) {
+    uint32_t r = (a >> 24) & 7u;
+    if (r == 5u) return vbds_wram_ptr[a & 0xFFFFu];
+    if (r == 7u) return vbds_rom_ptr[a & vbds_rom_mask];
+    return vb_read8(a);
+}
+static inline uint16_t vbds_r16(uint32_t a) {
+    uint32_t r = (a >> 24) & 7u;
+    if (r == 5u) return *(const vbds_u16a*)(vbds_wram_ptr + (a & 0xFFFEu));
+    if (r == 7u) return *(const vbds_u16a*)(vbds_rom_ptr + (a & vbds_rom_mask & ~1u));
+    return vb_read16(a);
+}
+static inline uint32_t vbds_r32(uint32_t a) {
+    uint32_t r = (a >> 24) & 7u;
+    if (r == 5u) return *(const vbds_u32a*)(vbds_wram_ptr + (a & 0xFFFCu));
+    if (r == 7u) return *(const vbds_u32a*)(vbds_rom_ptr + (a & vbds_rom_mask & ~3u));
+    return vb_read32(a);
+}
+static inline void vbds_w8(uint32_t a, uint8_t v) {
+    if (((a >> 24) & 7u) == 5u) vbds_wram_ptr[a & 0xFFFFu] = v;
+    else vb_write8(a, v);
+}
+static inline void vbds_w16(uint32_t a, uint16_t v) {
+    if (((a >> 24) & 7u) == 5u) *(vbds_u16a*)(vbds_wram_ptr + (a & 0xFFFEu)) = v;
+    else vb_write16(a, v);
+}
+static inline void vbds_w32(uint32_t a, uint32_t v) {
+    if (((a >> 24) & 7u) == 5u) *(vbds_u32a*)(vbds_wram_ptr + (a & 0xFFFCu)) = v;
+    else vb_write32(a, v);
+}
+
+#define VB_LEAN_READ8(cpu, a)      vbds_r8(a)
+#define VB_LEAN_READ16(cpu, a)     vbds_r16(a)
+#define VB_LEAN_READ32(cpu, a)     vbds_r32(a)
+#define VB_LEAN_WRITE8(cpu, a, v)  vbds_w8((a), (v))
+#define VB_LEAN_WRITE16(cpu, a, v) vbds_w16((a), (v))
+#define VB_LEAN_WRITE32(cpu, a, v) vbds_w32((a), (v))
 
 
 /* Wait loops: jump straight to the scheduler's deadline.  The stock macro

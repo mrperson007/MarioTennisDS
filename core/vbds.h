@@ -37,13 +37,29 @@ void vbds_run_frame(void);
 extern CPUState vbds_cpu;
 const uint8_t* vbds_wram(void);
 
+/* On the DS, hot runtime code lives in the ARM9's 32 KB instruction TCM:
+ * it never misses and cannot be evicted by the recompiled game code.
+ * Callers in main RAM reach it with a long call. */
+#if defined(ARM9) && !defined(VBDS_NO_ITCM)
+#define VBDS_FAST      __attribute__((section(".itcm"), long_call, noinline))
+#define VBDS_FAST_DECL __attribute__((long_call))
+#else
+#define VBDS_FAST
+#define VBDS_FAST_DECL
+#endif
+
 /* Guest bus. */
-uint8_t  vb_read8 (uint32_t addr);
-uint16_t vb_read16(uint32_t addr);
-uint32_t vb_read32(uint32_t addr);
-void     vb_write8 (uint32_t addr, uint8_t  v);
-void     vb_write16(uint32_t addr, uint16_t v);
-void     vb_write32(uint32_t addr, uint32_t v);
+VBDS_FAST_DECL uint8_t  vb_read8 (uint32_t addr);
+VBDS_FAST_DECL uint16_t vb_read16(uint32_t addr);
+VBDS_FAST_DECL uint32_t vb_read32(uint32_t addr);
+VBDS_FAST_DECL void     vb_write8 (uint32_t addr, uint8_t  v);
+VBDS_FAST_DECL void     vb_write16(uint32_t addr, uint16_t v);
+VBDS_FAST_DECL void     vb_write32(uint32_t addr, uint32_t v);
+
+/* Work RAM and ROM, for the inline fast paths in lean_platform.h. */
+extern uint8_t*       vbds_wram_ptr;
+extern const uint8_t* vbds_rom_ptr;
+extern uint32_t       vbds_rom_mask;
 
 /* Guest cycle at which the current bus access happens. */
 uint64_t vbds_access_cycle(void);
@@ -57,6 +73,7 @@ extern uint32_t (*vbds_tick_source)(void);
 extern uint32_t vbds_prof_draw_ticks;
 extern uint32_t vbds_prof_blocks_drawn, vbds_prof_blocks_skipped;
 extern uint32_t vbds_prof_passes;      /* scheduler stops */
+extern uint32_t vbds_prof_game_ticks;  /* time inside recompiled code */
 
 /* Supplied by the front end: report an unrecoverable error and stop. */
 #if defined(__GNUC__) || defined(__clang__)

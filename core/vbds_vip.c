@@ -74,10 +74,22 @@ static uint32_t s_block_sig[2][28][2];
 static uint8_t  s_block_valid[2][28];
 static uint8_t  s_fb_touched[2];
 
+/* Per-location multipliers must be unrelated to each other: with ones
+ * linear in the location, structured edits (every sprite moving up a row
+ * and right two pixels) can cancel out.  So the location is mixed with
+ * the MurmurHash3 finalizer. */
+static inline uint32_t mix32(uint32_t k) {
+    k ^= k >> 16; k *= 0x85EBCA6Bu;
+    k ^= k >> 13; k *= 0xC2B2AE35u;
+    k ^= k >> 16;
+    return k;
+}
+static inline uint32_t sig_key(uint32_t key) { return mix32(key) | 1u; }
+
 static inline void sig_update(uint32_t key, uint32_t old, uint32_t now) {
     uint32_t d = now - old;
-    s_sig[0] += d * ((key * 0x9E3779B1u) | 1u);
-    s_sig[1] += d * (((key ^ 0x5BD1E995u) * 0x85EBCA6Bu + 0xC2B2AE35u) | 1u);
+    s_sig[0] += d * sig_key(key);
+    s_sig[1] += d * sig_key(key ^ 0x5BD1E995u);
 }
 
 static void fb_settle(int slot) {
@@ -86,12 +98,113 @@ static void fb_settle(int slot) {
     memset(s_block_valid[slot], 0, sizeof(s_block_valid[slot]));
 }
 
+/* Per-block dependencies.
+ *
+ * Background maps, parameter tables, sprite attributes and characters
+ * change every frame somewhere, but usually only a few blocks of the
+ * screen show the changed part.  So instead of the global signature,
+ * those writes update narrower content signatures (same additive scheme):
+ *  - each 128-byte page and each 8 KB segment of VIP memory 0x20000-0x3FFFF;
+ *  - each group of 64 characters;
+ *  - each block: the sprite entries whose rows touch it, and the
+ *    attributes (other than the mode word) of every world whose window
+ *    covers it.
+ * A drawn block records the pages / segments and character groups it
+ * read and their signatures.  It is current if the global signature, its
+ * own block signature and every recorded signature still match.  Being
+ * content-based, values that flip back and forth (double buffering)
+ * leave each slot's blocks current.  Change stamps let the common case
+ * skip the per-dependency comparison.
+ *
+ * Each drawn block also gets a content version, shared when it is known
+ * to equal the other slot's block; the two slots show the same picture
+ * when every block has the same version in both. */
+#define DEP_MAX      96
+#define DEP_OVERFLOW 0xFFu          /* depends on every map page */
+#define DEP_SEG      0x8000u        /* entry names a segment, not a page */
+static uint32_t s_clock = 1;
+static uint32_t s_map_stamp, s_chr_stamp;
+static uint32_t s_page_sig[1024];
+static uint32_t s_seg_sig[16];
+static uint32_t s_row_sig[28];       /* sprites and world windows, per block */
+static uint32_t s_chr_sig[32];       /* character RAM, per 64 characters */
+static uint32_t s_cur_chr;
+static uint32_t s_block_time[2][28];
+static uint32_t s_block_row_sig[2][28];
+static uint32_t s_block_chr[2][28];  /* character groups the block used */
+static uint32_t s_block_chr_sum[2][28];
+static uint32_t s_block_ver[2][28];
+static uint32_t s_ver;
+static uint16_t s_block_dep[2][28][DEP_MAX];
+static uint32_t s_block_dep_sig[2][28][DEP_MAX];
+static uint8_t  s_block_dep_n[2][28];
+static uint16_t s_cur_dep[DEP_MAX];
+static unsigned s_cur_dep_n;
+
+
+static inline void dep_add(uint32_t e) {
+    unsigned n = s_cur_dep_n;
+    if (n >= DEP_MAX) { s_cur_dep_n = DEP_OVERFLOW; return; }
+    for (unsigned i = n, k = 0; i > 0 && k < 4; i--, k++)
+        if (s_cur_dep[i - 1] == e) return;
+    s_cur_dep[n] = (uint16_t)e;
+    s_cur_dep_n = n + 1;
+}
+/* A map halfword index (as the renderer forms it, 0..0xFFFF). */
+static inline void dep_cell(uint32_t idx) { dep_add((idx & 0xFFFFu) >> 6); }
+static inline uint32_t dep_sig(uint32_t e) {
+    return e & DEP_SEG ? s_seg_sig[e & 15u] : s_page_sig[e];
+}
+
+/* Blocks touched by a sprite at attribute row y. */
+static uint32_t oam_blocks(uint32_t y) {
+    uint32_t m = 0;
+    for (uint32_t r = y & 0xFFu, i = 0; i < 8u; i++, r = (r + 1u) & 0xFFu)
+        if (r < 224u) m |= 1u << (r >> 3);
+    return m;
+}
+static inline int16_t sign_11(uint32_t v);
+/* Blocks inside a world's window. */
+static uint32_t world_blocks(const uint16_t* wp) {
+    uint16_t gy = (uint16_t)sign_11(wp[3]);
+    uint32_t h = wp[8] & 0x3FFu, m = 0;
+    for (uint32_t r = 0; r < 224u; r++)
+        if ((uint16_t)(r - gy) <= h) m |= 1u << (r >> 3);
+    return m;
+}
+static void row_sig_add(uint32_t mask, uint32_t d) {
+    for (; mask; mask &= mask - 1) s_row_sig[__builtin_ctz(mask)] += d;
+}
+
+static int block_current(int slot, int b) {
+    if (!s_block_valid[slot][b]
+        || s_block_sig[slot][b][0] != s_sig[0]
+        || s_block_sig[slot][b][1] != s_sig[1]
+        || s_block_row_sig[slot][b] != s_row_sig[b]) return 0;
+    uint32_t t = s_block_time[slot][b];
+    if (s_chr_stamp > t) {
+        uint32_t sum = 0;
+        for (uint32_t m = s_block_chr[slot][b]; m; m &= m - 1)
+            sum += s_chr_sig[__builtin_ctz(m)];
+        if (sum != s_block_chr_sum[slot][b]) return 0;
+    }
+    if (s_map_stamp <= t) return 1;
+    unsigned n = s_block_dep_n[slot][b];
+    if (n == DEP_OVERFLOW) return 0;
+    const uint16_t* d = s_block_dep[slot][b];
+    const uint32_t* v = s_block_dep_sig[slot][b];
+    for (unsigned i = 0; i < n; i++)
+        if (dep_sig(d[i]) != v[i]) return 0;
+    /* Unchanged after all: move the block's time forward. */
+    s_block_time[slot][b] = s_clock;
+    return 1;
+}
+
 static int slots_show_same_picture(void) {
     fb_settle(0); fb_settle(1);
     for (int i = 0; i < 28; i++) {
         if (!s_block_valid[0][i] || !s_block_valid[1][i]) return 0;
-        if (s_block_sig[0][i][0] != s_block_sig[1][i][0]
-            || s_block_sig[0][i][1] != s_block_sig[1][i][1]) return 0;
+        if (s_block_ver[0][i] != s_block_ver[1][i]) return 0;
     }
     return 1;
 }
@@ -104,9 +217,105 @@ void vbds_vip_set_right_eye(int enabled) {
 }
 int vbds_vip_take_dirty(void) { int d = s_dirty; s_dirty = 0; return d; }
 
+/* Page output for small screens.
+ *
+ * As each block is drawn, its rows of the left-eye picture are reduced
+ * horizontally from 384 to 256 pixels and written, one byte per pixel,
+ * into the page of the slot being drawn.  Every 3 source pixels a b c
+ * become 2 output pixels from (a,b) and (b,c); each is the mean of the
+ * 2:1-weighted average and the maximum of the pair, so 1-pixel lines are
+ * never lost.  The 19 possible results are page values 1..19 (0 stays
+ * free as "transparent"); vbds_vip_page_level() gives their brightness.
+ * The front end does the vertical 224->149 step in hardware.  Pages hold
+ * 224 rows.
+ *
+ * A front end shows the page of vbds_vip_display_slot().  A CPU write into
+ * a framebuffer marks its page stale; vbds_vip_refresh_page() rebuilds it. */
+static uint8_t* s_page[2];
+static int      s_page_stride;
+static uint8_t  s_page_stale[2];
+static uint16_t s_hpair[64];            /* (a<<4|b<<2|c) -> out0 | out1 << 8 */
+
+static void page_init_tables(void) {
+    for (int i = 0; i < 64; i++) {
+        int a = i >> 4, b = (i >> 2) & 3, c = i & 3;
+        int m0 = a > b ? a : b, m1 = b > c ? b : c;
+        int o0 = 2 * a + b + 3 * m0, o1 = b + 2 * c + 3 * m1;     /* 0..18 */
+        s_hpair[i] = (uint16_t)((o0 + 1) | ((o1 + 1) << 8));
+    }
+}
+
+/* Reduce one row of 384 values (0..3) to 256 page values.  `src` is
+ * word-aligned; each pass reads 12 pixels (4 triples) as three words. */
+VBDS_FAST static void page_row(const uint8_t* src, uint8_t* dst) {
+    const uint32_t* in = (const uint32_t*)src;
+    uint32_t* out = (uint32_t*)dst;
+    for (int i = 0; i < 32; i++, in += 3, out += 2) {
+        uint32_t w0 = in[0], w1 = in[1], w2 = in[2];
+        uint32_t t0 = ((w0 << 4) & 0x30u) | ((w0 >> 6) & 0x0Cu) | ((w0 >> 16) & 3u);
+        uint32_t t1 = ((w0 >> 20) & 0x30u) | ((w1 << 2) & 0x0Cu) | ((w1 >> 8) & 3u);
+        uint32_t t2 = ((w1 >> 12) & 0x30u) | ((w1 >> 22) & 0x0Cu) | (w2 & 3u);
+        uint32_t t3 = ((w2 >> 4) & 0x30u) | ((w2 >> 14) & 0x0Cu) | ((w2 >> 24) & 3u);
+        out[0] = s_hpair[t0] | ((uint32_t)s_hpair[t1] << 16);
+        out[1] = s_hpair[t2] | ((uint32_t)s_hpair[t3] << 16);
+    }
+}
+
+void vbds_vip_set_page_output(uint8_t* page0, uint8_t* page1, int stride) {
+    page_init_tables();
+    s_page[0] = page0; s_page[1] = page1;
+    s_page_stride = stride;
+    s_page_stale[0] = s_page_stale[1] = 1;
+}
+
+int vbds_vip_page_level(int value) {
+    if (value <= 0) return 0;
+    int k = value - 1;                  /* level k/6 */
+    int lo = k / 6, frac = k % 6;
+    if (lo >= 3) return vbds_vip_level(3);
+    int l0 = vbds_vip_level(lo), l1 = vbds_vip_level(lo + 1);
+    return l0 + (l1 - l0) * frac / 6;
+}
+
+/* Packing drawn rows back into the 2-bit framebuffer only matters if the
+ * game reads or writes framebuffer memory itself; Mario's Tennis does
+ * neither, so a front end with page output can switch it off.  If the CPU
+ * does write a framebuffer later, packing comes back on for good. */
+static int s_pack = 1;
+static int s_skip_copy = 1, s_skip_all = 1;
+void vbds_vip_set_skipping(int enabled) { s_skip_copy = s_skip_all = enabled != 0; }
+void vbds_vip_set_pack(int enabled) { s_pack = enabled != 0; }
+
+int vbds_vip_display_slot(void) { return s_display_fb & 1; }
+int vbds_vip_page_stale(int slot) { return s_page[slot & 1] && s_page_stale[slot & 1]; }
+
+void vbds_vip_refresh_page(int slot) {
+    slot &= 1;
+    if (!s_page[slot]) return;
+    const uint8_t* fb = &s_low[slot ? 0x8000u : 0x0000u];
+    uint32_t row_store[96];
+    uint8_t* row = (uint8_t*)row_store;
+    for (int y = 0; y < 224; y++) {
+        int shift = (y & 3) * 2;
+        for (int x = 0; x < 384; x++) row[x] = (fb[x * 64 + (y >> 2)] >> shift) & 3;
+        page_row(row, s_page[slot] + y * s_page_stride);
+    }
+    s_page_stale[slot] = 0;
+}
+
+/* Background tile rows, four pixels at a time: for a byte of 2-bit pixels,
+ * s_bg4[palette][byte] holds the four palette-mapped values and
+ * s_bg4_opaque[byte] a bit per non-zero pixel. */
+static uint32_t s_bg4[4][256];
+static uint8_t  s_bg4_opaque[256];
+
 static void recalc_gplt_cache(int which) {
     for (int i = 0; i < 4; ++i)
         s_gplt_cache[which][i] = (uint8_t)((s_gplt[which] >> (i * 2)) & 3u);
+    const uint8_t* pal = s_gplt_cache[which];
+    for (int b = 0; b < 256; b++)
+        s_bg4[which][b] = (uint32_t)pal[b & 3] | (uint32_t)pal[(b >> 2) & 3] << 8
+                        | (uint32_t)pal[(b >> 4) & 3] << 16 | (uint32_t)pal[b >> 6] << 24;
 }
 static void recalc_jplt_cache(int which) {
     for (int i = 0; i < 4; ++i)
@@ -161,9 +370,16 @@ static void vip_check_irq(void) {
     vb_irq_assert(VBIRQ_SOURCE_VIP, (s_intpnd & s_intenb) ? 1 : 0);
 }
 
+/* s_rev2bpp[b]: the four 2-bit pixels of byte b in reverse order. */
+static uint8_t s_rev2bpp[256];
+
 static void vip_draw_block_now(uint8_t block_no);
 
 void vb_vip_init(void) {
+    for (int b = 0; b < 256; b++) {
+        s_rev2bpp[b] = (uint8_t)(((b & 3) << 6) | ((b >> 2 & 3) << 4) | ((b >> 4 & 3) << 2) | (b >> 6));
+        s_bg4_opaque[b] = (uint8_t)(((b & 3) ? 1 : 0) | ((b & 0x0C) ? 2 : 0) | ((b & 0x30) ? 4 : 0) | ((b & 0xC0) ? 8 : 0));
+    }
     memset(s_low_store, 0, sizeof(s_low_store));
     memset(s_chr, 0, sizeof(s_chr));
     s_intpnd = 0; s_intenb = 0;
@@ -195,26 +411,64 @@ void vb_vip_init(void) {
     memset(s_block_valid, 0, sizeof(s_block_valid));
     s_fb_touched[0] = s_fb_touched[1] = 0;
     s_right_eye = 0;
+    /* Rebuild the narrow signatures from memory. */
+    s_clock = 1; s_map_stamp = s_chr_stamp = 0;
+    memset(s_page_sig, 0, sizeof(s_page_sig));
+    memset(s_seg_sig, 0, sizeof(s_seg_sig));
+    memset(s_row_sig, 0, sizeof(s_row_sig));
+    memset(s_chr_sig, 0, sizeof(s_chr_sig));
+    {
+        const uint16_t* m = (const uint16_t*)&s_low[0x20000u];
+        for (uint32_t i = 0; i < 0x10000u; i++) {
+            uint32_t o = 0x20000u + i * 2u;
+            if (o >= 0x3DC00u && o < 0x3E000u) continue;
+            uint32_t d = m[i] * sig_key(o >> 1);
+            s_page_sig[i >> 6] += d; s_seg_sig[i >> 12] += d;
+        }
+        for (uint32_t e = 0; e < 1024u; e++) {
+            const uint16_t* ent = m + (0x1E000u + e * 8u) / 2u;
+            uint32_t hsh = 0, key = 0x40000u + (uint32_t)(ent - (const uint16_t*)s_low);
+            for (unsigned i = 0; i < 4u; i++) hsh += ent[i] * sig_key(key + i);
+            row_sig_add(oam_blocks(ent[2]), hsh);
+        }
+        for (uint32_t w = 0; w < 32u; w++) {
+            const uint16_t* ent = m + (0x1D800u + w * 32u) / 2u;
+            uint32_t hsh = 0, key = 0x50000u + (uint32_t)(ent - (const uint16_t*)s_low);
+            for (unsigned i = 1; i < 16u; i++) hsh += ent[i] * sig_key(key + i);
+            row_sig_add(world_blocks(ent), hsh);
+            sig_update(SIG_KEY_REG + 0x200 + w * 16u, 0, ent[0]);
+        }
+        const uint16_t* c = s_chr;
+        for (uint32_t i = 0; i < VIP_CHR_SIZE / 2u; i++)
+            s_chr_sig[i >> 9] += c[i] * sig_key(0x60000u + i);
+    }
     vip_check_irq();
 }
 
 /* ----------------- Column state machine ----------------- */
 
-static void vip_advance_column(void) {
-    /* Brightness "repeat" sample from the column table, every 4 columns
-     * of an active display half (Beetle vip.c:1357-1366). */
-    if ((s_display_region & 1) && !(s_column & 3)) {
-        int lr = (s_display_region & 2) >> 1;
-        uint32_t flat = 0x20000u + 0x1DFFEu
-                      - (uint32_t)((s_column >> 2) * 2) - (lr ? 0u : 0x200u);
-        uint8_t repeat = s_low[flat + 1];
-        if (repeat != s_brt_repeat) {
-            s_brt_repeat = repeat;
-            recalc_brt_cache();
+/* Pass `k` column boundaries at once (never beyond the end of a phase).
+ *
+ * In an active display half the hardware samples a brightness "repeat"
+ * value from the column table every 4 columns (Beetle vip.c:1357-1366).
+ * Only the last sample of a span can still matter - nothing reads the
+ * brightness in between - so only that one is taken. */
+static void vip_advance_columns(int32_t k) {
+    if (s_display_region & 1) {
+        int32_t last = (s_column + k - 1) & ~3;
+        if (last >= s_column) {
+            int lr = (s_display_region & 2) >> 1;
+            uint32_t flat = 0x20000u + 0x1DFFEu
+                          - (uint32_t)((last >> 2) * 2) - (lr ? 0u : 0x200u);
+            uint8_t repeat = s_low[flat + 1];
+            if (repeat != s_brt_repeat) {
+                s_brt_repeat = repeat;
+                recalc_brt_cache();
+            }
         }
     }
 
-    s_column++;
+    s_column += k;
     if (s_column != VIP_COLUMNS_PER_PHASE) return;
     s_column = 0;
 
@@ -273,22 +527,24 @@ static void vip_advance_chunk(int32_t chunk_clocks) {
         }
     }
 
-    s_column_counter -= chunk_clocks;
-    if (s_column_counter == 0) {
-        s_column_counter = VIP_CYCLES_PER_COLUMN;
-        vip_advance_column();
-    }
+    if (chunk_clocks < s_column_counter) { s_column_counter -= chunk_clocks; return; }
+    int32_t rest = chunk_clocks - s_column_counter;
+    s_column_counter = VIP_CYCLES_PER_COLUMN - rest % VIP_CYCLES_PER_COLUMN;
+    vip_advance_columns(1 + rest / VIP_CYCLES_PER_COLUMN);
 }
 
-void vb_vip_tick(uint64_t cycles) {
+VBDS_FAST void vb_vip_tick(uint64_t cycles) {
     s_update_span = cycles;
     int64_t clocks = (int64_t)cycles;
     while (clocks > 0) {
         int32_t chunk = clocks > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)clocks;
         if (s_drawing_counter > 0 && chunk > s_drawing_counter)
             chunk = s_drawing_counter;
-        if (chunk > s_column_counter)
-            chunk = s_column_counter;
+        /* Many columns per step, but stop at the end of a display phase. */
+        int32_t to_phase_end = s_column_counter
+            + (VIP_COLUMNS_PER_PHASE - 1 - s_column) * VIP_CYCLES_PER_COLUMN;
+        if (chunk > to_phase_end)
+            chunk = to_phase_end;
         if (chunk <= 0) chunk = 1;
         vip_advance_chunk(chunk);
         clocks -= chunk;
@@ -449,21 +705,74 @@ static inline uint8_t* vip_ptr(uint32_t o, int* kind) {
     return s_unmapped;
 }
 
-static void vip_store(uint32_t o, uint32_t v, unsigned width) {
+VBDS_FAST static void vip_store(uint32_t o, uint32_t v, unsigned width) {
     int kind;
     uint8_t* p = vip_ptr(o, &kind);
     if (!kind) return;
     uint32_t old = 0;
     for (unsigned i = 0; i < width; i++) old |= (uint32_t)p[i] << (i * 8);
     if (old == v) return;
-    if (kind == 2) {
+    if (kind == 2 && o >= 0x20000u && o < 0x40000u
+        && (o < 0x3DC00u || o >= 0x3E000u)) {
+        /* Maps, parameter tables, world attributes, sprite attributes. */
+        const int oam = o >= 0x3E000u, world = o >= 0x3D800u && o < 0x3DC00u;
+        uint16_t* h = (uint16_t*)&s_low[o & ~1u];
+        uint16_t* ent = (uint16_t*)&s_low[oam ? (o & ~7u) : (o & ~31u)];
+        const uint32_t ekey = (oam ? 0x40000u : 0x50000u) + (uint32_t)(ent - (uint16_t*)s_low);
+        const unsigned ewords = oam ? 4u : 16u;
+        uint32_t emask_old = 0, ehash_old = 0;
+        if (oam || world) {
+            emask_old = oam ? oam_blocks(ent[2]) : world_blocks(ent);
+            for (unsigned i = world; i < ewords; i++) ehash_old += ent[i] * sig_key(ekey + i);
+        }
+        uint32_t w0_old = ent[0];
+        uint32_t hw_old[2] = { h[0], width == 4 ? h[1] : 0 };
+        for (unsigned i = 0; i < width; i++) p[i] = (uint8_t)(v >> (i * 8));
+        /* Page and segment signatures, per halfword written. */
+        uint32_t page = (o - 0x20000u) >> 7, seg = (o - 0x20000u) >> 13;
+        for (unsigned i = 0; i < (width == 4 ? 2u : 1u); i++) {
+            uint32_t d = (uint32_t)(h[i] - hw_old[i]) * sig_key((o >> 1) + i);
+            s_page_sig[page] += d;
+            s_seg_sig[seg] += d;
+        }
+        s_map_stamp = ++s_clock;
+        if (oam || world) {
+            if (world && ent[0] != w0_old)
+                sig_update(SIG_KEY_REG + 0x200 + (uint32_t)(ent - (uint16_t*)&s_low[0x3D800u]),
+                           w0_old, ent[0]);
+            uint32_t ehash = 0;
+            for (unsigned i = world; i < ewords; i++) ehash += ent[i] * sig_key(ekey + i);
+            row_sig_add(emask_old, 0u - ehash_old);
+            row_sig_add(oam ? oam_blocks(ent[2]) : world_blocks(ent), ehash);
+        }
+    } else if (kind == 2 && p >= (uint8_t*)s_chr && p < (uint8_t*)s_chr + VIP_CHR_SIZE) {
+        uint32_t off = (uint32_t)(p - (uint8_t*)s_chr) & ~1u;
+        uint16_t* h = (uint16_t*)((uint8_t*)s_chr + off);
+        uint32_t hw_old[2] = { h[0], width == 4 ? h[1] : 0 };
+        for (unsigned i = 0; i < width; i++) p[i] = (uint8_t)(v >> (i * 8));
+        for (unsigned i = 0; i < (width == 4 ? 2u : 1u); i++)
+            s_chr_sig[off >> 10] += (uint32_t)(h[i] - hw_old[i]) * sig_key(0x60000u + (off >> 1) + i);
+        s_chr_stamp = ++s_clock;
+    } else if (kind == 2) {
         /* Key on the storage location so every alias of character RAM
          * updates the same terms. */
         uint32_t key = (uint32_t)(p - (p >= (uint8_t*)s_chr && p < (uint8_t*)s_chr + VIP_CHR_SIZE
                                        ? (uint8_t*)s_chr - 0x80000u : s_low));
-        for (unsigned i = 0; i < width; i++) {
-            uint8_t nb = (uint8_t)(v >> (i * 8));
-            if (p[i] != nb) { sig_update(key + i, p[i], nb); p[i] = nb; }
+        /* One signature term per halfword, whatever the access width. */
+        if (width == 1) {
+            uint8_t* h = p - (key & 1u);
+            uint32_t before = (uint32_t)h[0] | (uint32_t)h[1] << 8;
+            p[0] = (uint8_t)v;
+            sig_update(key >> 1, before, (uint32_t)h[0] | (uint32_t)h[1] << 8);
+        } else {
+            for (unsigned i = 0; i < width; i += 2) {
+                uint32_t before = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8;
+                uint32_t after = (v >> (i * 8)) & 0xFFFFu;
+                if (before != after) {
+                    sig_update((key + i) >> 1, before, after);
+                    p[i] = (uint8_t)after; p[i + 1] = (uint8_t)(after >> 8);
+                }
+            }
         }
     } else {
         for (unsigned i = 0; i < width; i++) p[i] = (uint8_t)(v >> (i * 8));
@@ -471,11 +780,13 @@ static void vip_store(uint32_t o, uint32_t v, unsigned width) {
          * 0x8000/0x18000. */
         int slot = (o >> 15) & 1;
         s_fb_touched[slot] = 1;
+        if (o < 0x10000u) s_page_stale[slot] = 1;
+        s_pack = 1;
         if (slot == s_display_fb) s_dirty = 1;
     }
 }
 
-uint8_t vb_vip_read8(uint32_t addr) {
+VBDS_FAST uint8_t vb_vip_read8(uint32_t addr) {
     uint32_t o = addr & (VIP_WINDOW_SIZE - 1u);
     if (vip_is_register(o)) {
         uint16_t r = vip_read_register16(o & ~1u);
@@ -485,7 +796,7 @@ uint8_t vb_vip_read8(uint32_t addr) {
     return *vip_ptr(o, &kind);
 }
 
-uint16_t vb_vip_read16(uint32_t addr) {
+VBDS_FAST uint16_t vb_vip_read16(uint32_t addr) {
     uint32_t o = (addr & (VIP_WINDOW_SIZE - 1u)) & ~1u;
     if (vip_is_register(o)) return vip_read_register16(o);
     int kind;
@@ -493,7 +804,7 @@ uint16_t vb_vip_read16(uint32_t addr) {
     return (uint16_t)(p[0] | (p[1] << 8));
 }
 
-uint32_t vb_vip_read32(uint32_t addr) {
+VBDS_FAST uint32_t vb_vip_read32(uint32_t addr) {
     uint32_t o = (addr & (VIP_WINDOW_SIZE - 1u)) & ~3u;
     if (vip_is_register(o))
         return (uint32_t)vip_read_register16(o)
@@ -504,7 +815,7 @@ uint32_t vb_vip_read32(uint32_t addr) {
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-void vb_vip_write8(uint32_t addr, uint8_t v) {
+VBDS_FAST void vb_vip_write8(uint32_t addr, uint8_t v) {
     uint32_t o = addr & (VIP_WINDOW_SIZE - 1u);
     if (vip_is_register(o)) {
         uint16_t current = vip_read_register16(o & ~1u);
@@ -517,13 +828,13 @@ void vb_vip_write8(uint32_t addr, uint8_t v) {
     vip_store(o, v, 1);
 }
 
-void vb_vip_write16(uint32_t addr, uint16_t v) {
+VBDS_FAST void vb_vip_write16(uint32_t addr, uint16_t v) {
     uint32_t o = (addr & (VIP_WINDOW_SIZE - 1u)) & ~1u;
     if (vip_is_register(o)) { vip_write_register16(o, v); return; }
     vip_store(o, v, 2);
 }
 
-void vb_vip_write32(uint32_t addr, uint32_t v) {
+VBDS_FAST void vb_vip_write32(uint32_t addr, uint32_t v) {
     uint32_t o = (addr & (VIP_WINDOW_SIZE - 1u)) & ~3u;
     if (vip_is_register(o)) {
         vip_write_register16(o, (uint16_t)v);
@@ -552,7 +863,7 @@ static inline int16_t sign_10(uint32_t v) { return (int16_t)(((v & 0x3FFu) ^ 0x2
 static inline int16_t sign_11(uint32_t v) { return (int16_t)(((v & 0x7FFu) ^ 0x400u) - 0x400u); }
 static inline int16_t sign_9(uint32_t v)  { return (int16_t)(((v & 0x1FFu) ^ 0x100u) - 0x100u); }
 
-static void draw_bg(uint8_t* target, uint16_t real_y,
+VBDS_FAST static void draw_bg(uint8_t* target, uint16_t real_y,
                     uint8_t bgmap_base_raw, int overplane, uint16_t overplane_char,
                     int32_t source_x, int32_t source_y,
                     uint32_t scx, uint32_t scy,
@@ -583,6 +894,11 @@ static void draw_bg(uint8_t* target, uint16_t real_y,
     bgmap_base |= (((uint32_t)source_y >> 3) & 0x3Fu) * 0x40u
                 | (((uint32_t)source_y << 3) & ~0xFFFu) << scx;
 
+    dep_cell(overplane_char);
+    for (uint32_t sx = 0; sx < (1u << scx); sx++)
+        dep_cell(bgmap_base | sx << 12);
+
+    uint32_t used = 0;
     for (int x = start_x; x <= final_x; x++) {
         uint32_t source_x_u = (uint32_t)source_x & source_x_mask;
         uint32_t bgsc = bgsc_overplane;
@@ -594,6 +910,7 @@ static void draw_bg(uint8_t* target, uint16_t real_y,
         }
 
         uint32_t char_no    = bgsc & 0x7FFu;
+        used |= 1u << (char_no >> 6);
         const uint8_t* pal  = s_gplt_cache[bgsc >> 14];
         uint32_t hflip_xor  = (bgsc & 0x2000u) ? 7u : 0u;
         uint32_t vflip_xor  = (bgsc & 0x1000u) ? 7u : 0u;
@@ -602,15 +919,20 @@ static void draw_bg(uint8_t* target, uint16_t real_y,
         if (!(source_x_u & 7u) && (x + 7) <= final_x) {
             uint32_t pixels = chr[char_no * 8u + char_sub_y];
             if (pixels) {
-                if (bgsc & 0x2000u) {
-                    for (int sub = 0; sub < 8; ++sub) {
-                        uint32_t v = (pixels >> (14 - sub * 2)) & 3u;
-                        if (v) target[x + sub] = pal[v];
-                    }
-                } else {
-                    for (int sub = 0; sub < 8; ++sub) {
-                        uint32_t v = (pixels >> (sub * 2)) & 3u;
-                        if (v) target[x + sub] = pal[v];
+                if (bgsc & 0x2000u)
+                    pixels = (uint32_t)(s_rev2bpp[pixels & 0xFFu] << 8) | s_rev2bpp[pixels >> 8];
+                const uint32_t* lut = s_bg4[bgsc >> 14];
+                uint8_t* t = target + x;
+                for (int half = 0; half < 2; half++, t += 4, pixels >>= 8) {
+                    uint32_t b = pixels & 0xFFu, m = s_bg4_opaque[b], w = lut[b];
+                    if (m == 0xFu) {
+                        t[0] = (uint8_t)w; t[1] = (uint8_t)(w >> 8);
+                        t[2] = (uint8_t)(w >> 16); t[3] = (uint8_t)(w >> 24);
+                    } else if (m) {
+                        if (m & 1u) t[0] = (uint8_t)w;
+                        if (m & 2u) t[1] = (uint8_t)(w >> 8);
+                        if (m & 4u) t[2] = (uint8_t)(w >> 16);
+                        if (m & 8u) t[3] = (uint8_t)(w >> 24);
                     }
                 }
             }
@@ -623,9 +945,10 @@ static void draw_bg(uint8_t* target, uint16_t real_y,
             source_x++;
         }
     }
+    s_cur_chr |= used;
 }
 
-static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
+VBDS_FAST static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
                         uint32_t param_base, uint32_t bgmap_base,
                         int overplane_mode, uint16_t overplane_char,
                         uint32_t scx, uint32_t scy,
@@ -647,6 +970,9 @@ static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
 
     dest_x = (uint16_t)sign_10((uint32_t)dest_x);
     if ((uint16_t)(real_y - dest_y) > dest_height) return;
+
+    dep_cell(param_base + 8u * (real_y - dest_y));
+    dep_cell(overplane_char);
 
     source_x = (uint32_t)((int32_t)mx << 6);
     source_y = (uint32_t)((int32_t)my << 6);
@@ -681,23 +1007,62 @@ static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
         if (source_y >= (source_y_size << 9)) return;
         bgmap_base |= (((source_y >> 6) & ~0xFFFu) << scx)
                     | (((source_y >> 12) & 0x3Fu) * 0x40u);
-        for (int x = start_x; x <= final_x; x++) {
-            uint32_t bgsc = bgsc_overplane;
-            source_x &= source_x_mask;
-            if (source_x < (source_x_size << 9)) {
-                uint32_t idx = (bgmap_base | ((source_x >> 6) & ~0xFFFu)
-                              | ((source_x >> 12) & 0x3Fu)) & 0xFFFFu;
-                bgsc = bgm[idx];
+        for (uint32_t k = 0; k < (1u << scx); k++)
+            dep_cell(bgmap_base | k << 12);
+        /* Walk the row one map cell (8 source pixels) at a time: look up the
+         * cell and its character row once, then step through it.  Cells are
+         * 4096 source units wide and every mask and size limit is a multiple
+         * of that, so a cell is entirely inside or outside the map. */
+        const uint32_t xlimit = source_x_size << 9;
+        const uint32_t sub_y = (source_y >> 9) & 0x7u;
+        /* 2^32 / |dx|, so the steps left in a cell need no division. */
+        const uint32_t adx = (uint32_t)(dx < 0 ? -dx : dx);
+        const uint32_t recip = adx ? (uint32_t)(0xFFFFFFFFu / adx) : 0;
+        uint32_t sx = source_x & source_x_mask;
+        uint32_t used = 0;
+        int x = start_x;
+        while (x <= final_x) {
+            const uint32_t cell = sx >> 12;
+            /* Output pixels until sx leaves this cell: the smallest n with
+             * sx + n*dx outside [cell*4096, cell*4096 + 4096). */
+            int n;
+            if (!adx) {
+                n = final_x - x + 1;
+            } else {
+                uint32_t dist = dx > 0 ? ((cell + 1) << 12) - sx + adx - 1
+                                       : sx - (cell << 12) + adx;
+                n = (int)(((uint64_t)dist * recip) >> 32);
+                if ((uint32_t)n * adx > dist) n--;          /* estimate may be 1 high */
+                if ((uint32_t)(n + 1) * adx <= dist) n++;   /* ...or 1 low */
+                if (n < 1) n = 1;
+                if (n > final_x - x + 1) n = final_x - x + 1;
             }
-            uint32_t hflip_xor = (uint32_t)(((int32_t)(bgsc << 18) >> 30) & 0xE);
-            uint32_t vflip_xor = (uint32_t)(((int32_t)(bgsc << 19) >> 31) & 0x7);
-            uint32_t char_sub_y = vflip_xor ^ ((source_y >> 9) & 0x7u);
-            uint32_t char_sub_x = hflip_xor ^ ((source_x >> 8) & 0xEu);
-            uint32_t pixel = (chr[((bgsc & 0x7FFu) * 8u) | char_sub_y] >> char_sub_x) & 0x3u;
-            if (pixel) target[x] = s_gplt_cache[bgsc >> 14][pixel];
-            source_x = (uint32_t)((int32_t)source_x + dx);
+            uint32_t bgsc = bgsc_overplane;
+            if (sx < xlimit)
+                bgsc = bgm[(bgmap_base | ((sx >> 6) & ~0xFFFu)
+                           | ((sx >> 12) & 0x3Fu)) & 0xFFFFu];
+            used |= 1u << ((bgsc & 0x7FFu) >> 6);
+            uint32_t row = chr[((bgsc & 0x7FFu) * 8u)
+                               | (((bgsc & 0x1000u) ? 7u : 0u) ^ sub_y)];
+            if (row) {
+                if (bgsc & 0x2000u)
+                    row = (uint32_t)(s_rev2bpp[row & 0xFFu] << 8) | s_rev2bpp[row >> 8];
+                const uint8_t* pal = s_gplt_cache[bgsc >> 14];
+                uint32_t p = sx;
+                uint8_t* t = target + x;
+                for (int k = 0; k < n; k++) {
+                    uint32_t v = (row >> ((p >> 8) & 0xEu)) & 0x3u;
+                    if (v) t[k] = pal[v];
+                    p += (uint32_t)dx;
+                }
+            }
+            x += n;
+            sx = (uint32_t)((int32_t)sx + (int32_t)n * dx) & source_x_mask;
         }
+        s_cur_chr |= used;
     } else {
+        for (uint32_t k = 0; k < (1u << (scx + scy)); k++)
+            dep_add(DEP_SEG | (((bgmap_base >> 12) | k) & 15u));
         for (int x = start_x; x <= final_x; x++) {
             uint32_t bgsc = bgsc_overplane;
             source_x &= source_x_mask;
@@ -713,6 +1078,7 @@ static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
             uint32_t vflip_xor  = (bgsc & 0x1000u) ? 7u : 0u;
             uint32_t char_sub_y = vflip_xor ^ ((source_y >> 9) & 0x7u);
             uint32_t char_sub_x = hflip_xor ^ ((source_x >> 9) & 0x7u);
+            s_cur_chr |= 1u << ((bgsc & 0x7FFu) >> 6);
             uint32_t pixel = (chr[(bgsc & 0x7FFu) * 8u + char_sub_y] >> (char_sub_x * 2u)) & 0x3u;
             if (pixel) target[x] = s_gplt_cache[bgsc >> 14][pixel];
             source_x = (uint32_t)((int32_t)source_x + dx);
@@ -721,7 +1087,7 @@ static void draw_affine(uint8_t* target, uint16_t real_y, int lr,
     }
 }
 
-static void draw_obj(uint8_t* fb_lr[2], uint16_t y, const int lron[2]) {
+VBDS_FAST static void draw_obj(uint8_t* fb_lr[2], uint16_t y, const int lron[2]) {
     const uint16_t* chr = s_chr;
     const uint16_t* bgm = dram_u16();
     int32_t start_oam = s_spt[s_obj_search_which];
@@ -734,6 +1100,7 @@ static void draw_obj(uint8_t* fb_lr[2], uint16_t y, const int lron[2]) {
         if (tile_y >= 8u) continue;
 
         uint32_t attr = oam_ptr[3];
+        s_cur_chr |= 1u << ((attr & 0x7FFu) >> 6);
         uint32_t char_sub_y = ((attr & 0x1000u) ? 7u : 0u) ^ tile_y;
         uint32_t pixels_save = chr[(attr & 0x7FFu) * 8u + char_sub_y];
         if (!pixels_save) continue;
@@ -767,13 +1134,15 @@ static void draw_obj(uint8_t* fb_lr[2], uint16_t y, const int lron[2]) {
     } while ((oam = (oam - 1) & 1023) != end_oam);
 }
 
-static void vip_draw_block_into(uint8_t block_no, uint8_t* fb_l, uint8_t* fb_r) {
+VBDS_FAST static void vip_draw_block_into(uint8_t block_no, uint8_t* fb_l, uint8_t* fb_r) {
     const uint16_t* bgm = dram_u16();
     const int eyes = s_right_eye ? 2 : 1;
     const uint8_t bkcol = (uint8_t)(s_bkcol & 0x3u);
 
     for (int lr = 0; lr < eyes; lr++)
         memset(s_row_buf[lr], bkcol, 8 * ROW_STRIDE);
+    s_cur_dep_n = 0;
+    s_cur_chr = 0;
 
     s_obj_search_which = 3;
 
@@ -821,10 +1190,11 @@ static void vip_draw_block_into(uint8_t block_no, uint8_t* fb_l, uint8_t* fb_r) 
                     } else {
                         uint16_t src_x = mx + (uint16_t)(lr ? mp : -mp);
                         uint16_t src_y = my + (uint16_t)(real_y - gy);
-                        if (bgm_mode == 1u)
-                            src_x += (uint16_t)(int16_t)bgm[
-                                (param_base + (((real_y - gy) * 2u) | (uint32_t)lr))
-                                & 0xFFFFu];
+                        if (bgm_mode == 1u) {
+                            uint32_t pi = param_base + (((real_y - gy) * 2u) | (uint32_t)lr);
+                            dep_cell(pi);
+                            src_x += (uint16_t)(int16_t)bgm[pi & 0xFFFFu];
+                        }
                         draw_bg(fb[lr], real_y, (uint8_t)bgmap_base, over, over_chr,
                                 (int32_t)(int16_t)src_x, (int32_t)(int16_t)src_y,
                                 scx, scy, dst_x, gy, window_w, window_h);
@@ -838,7 +1208,7 @@ static void vip_draw_block_into(uint8_t block_no, uint8_t* fb_l, uint8_t* fb_r) 
 
     /* Pack 8 rows of byte pixels into two 2bpp bytes per column, four
      * columns at a time: each row contributes one word of four pixels. */
-    for (int lr = 0; lr < eyes; lr++) {
+    for (int lr = 0; s_pack && lr < eyes; lr++) {
         uint8_t* fb_target = (lr == 0 ? fb_l : fb_r) + block_no * 2;
         const uint32_t* src = &s_row_store[lr][PAD_LEFT / 4];
         for (int x = 0; x < 384; x += 4, src++, fb_target += 256) {
@@ -855,20 +1225,64 @@ static void vip_draw_block_into(uint8_t block_no, uint8_t* fb_l, uint8_t* fb_r) 
 }
 
 static void vip_draw_block_now(uint8_t block_no) {
-    int slot = s_drawing_fb & 1;
-    fb_settle(slot);
-    if (s_block_valid[slot][block_no]
-        && s_block_sig[slot][block_no][0] == s_sig[0]
-        && s_block_sig[slot][block_no][1] == s_sig[1]) {
+    int slot = s_drawing_fb & 1, other = slot ^ 1;
+    fb_settle(slot); fb_settle(other);
+    if (s_skip_all && block_current(slot, block_no)) {
         vbds_prof_blocks_skipped++;
         return;                     /* already holds exactly this picture */
+    }
+    if (block_current(other, block_no)) {
+        if (!s_pack && s_page[slot] && s_page[other] && s_skip_copy) {
+            /* The other slot already has this block: copy its page rows. */
+            for (int y = 0; y < 8; y++) {
+                int off = (block_no * 8 + y) * s_page_stride;
+                memcpy(s_page[slot] + off, s_page[other] + off, 256);
+            }
+            s_block_sig[slot][block_no][0] = s_sig[0];
+            s_block_sig[slot][block_no][1] = s_sig[1];
+            s_block_time[slot][block_no] = s_block_time[other][block_no];
+            s_block_row_sig[slot][block_no] = s_block_row_sig[other][block_no];
+            s_block_dep_n[slot][block_no] = s_block_dep_n[other][block_no];
+            memcpy(s_block_dep[slot][block_no], s_block_dep[other][block_no],
+                   sizeof(s_block_dep[0][0]));
+            memcpy(s_block_dep_sig[slot][block_no], s_block_dep_sig[other][block_no],
+                   sizeof(s_block_dep_sig[0][0]));
+            s_block_ver[slot][block_no] = s_block_ver[other][block_no];
+            s_block_chr[slot][block_no] = s_block_chr[other][block_no];
+            s_block_chr_sum[slot][block_no] = s_block_chr_sum[other][block_no];
+            s_block_valid[slot][block_no] = 1;
+            if (slot == s_display_fb) s_dirty = 1;
+            vbds_prof_blocks_skipped++;
+            return;
+        }
+        s_block_ver[slot][block_no] = s_block_ver[other][block_no];
+    } else {
+        s_block_ver[slot][block_no] = ++s_ver;
     }
     uint32_t t0 = vbds_tick_source ? vbds_tick_source() : 0;
     uint8_t* fb_l = &s_low[slot ? 0x8000u  : 0x0000u];
     uint8_t* fb_r = &s_low[slot ? 0x18000u : 0x10000u];
     vip_draw_block_into(block_no, fb_l, fb_r);
+    if (s_page[slot])
+        for (int y = 0; y < 8; y++)
+            page_row(&s_row_buf[0][PAD_LEFT + y * ROW_STRIDE],
+                     s_page[slot] + (block_no * 8 + y) * s_page_stride);
     s_block_sig[slot][block_no][0] = s_sig[0];
     s_block_sig[slot][block_no][1] = s_sig[1];
+    s_block_time[slot][block_no] = s_clock;
+    s_block_row_sig[slot][block_no] = s_row_sig[block_no];
+    s_block_chr[slot][block_no] = s_cur_chr;
+    {
+        uint32_t sum = 0;
+        for (uint32_t m = s_cur_chr; m; m &= m - 1) sum += s_chr_sig[__builtin_ctz(m)];
+        s_block_chr_sum[slot][block_no] = sum;
+    }
+    s_block_dep_n[slot][block_no] = (uint8_t)s_cur_dep_n;
+    if (s_cur_dep_n != DEP_OVERFLOW) {
+        memcpy(s_block_dep[slot][block_no], s_cur_dep, s_cur_dep_n * sizeof(uint16_t));
+        for (unsigned i = 0; i < s_cur_dep_n; i++)
+            s_block_dep_sig[slot][block_no][i] = dep_sig(s_cur_dep[i]);
+    }
     s_block_valid[slot][block_no] = 1;
     if (slot == s_display_fb) s_dirty = 1;
     vbds_prof_blocks_drawn++;

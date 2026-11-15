@@ -8,6 +8,7 @@
 #define VBDS_VIP_H
 
 #include <stdint.h>
+#include "vbds.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,19 +25,37 @@ extern "C" {
 #define VB_VIP_INT_MASK_VALID  0xE01Fu
 
 void vb_vip_init(void);
-void vb_vip_tick(uint64_t cycles);
+VBDS_FAST_DECL void vb_vip_tick(uint64_t cycles);
 int32_t vb_vip_cycles_to_next_event(void);
 
-uint8_t  vb_vip_read8 (uint32_t addr);
-uint16_t vb_vip_read16(uint32_t addr);
-uint32_t vb_vip_read32(uint32_t addr);
-void     vb_vip_write8 (uint32_t addr, uint8_t  v);
-void     vb_vip_write16(uint32_t addr, uint16_t v);
-void     vb_vip_write32(uint32_t addr, uint32_t v);
+VBDS_FAST_DECL uint8_t  vb_vip_read8 (uint32_t addr);
+VBDS_FAST_DECL uint16_t vb_vip_read16(uint32_t addr);
+VBDS_FAST_DECL uint32_t vb_vip_read32(uint32_t addr);
+VBDS_FAST_DECL void     vb_vip_write8 (uint32_t addr, uint8_t  v);
+VBDS_FAST_DECL void     vb_vip_write16(uint32_t addr, uint16_t v);
+VBDS_FAST_DECL void     vb_vip_write32(uint32_t addr, uint32_t v);
 
 /* Displayed framebuffer for one eye (0 = left, 1 = right): 384 columns of
  * 64 bytes, 2 bits per pixel, four rows per byte, low bits first. */
 const uint8_t* vbds_vip_display_fb(int eye);
+
+/* Page output (see vbds_vip.c): the left-eye picture reduced to 256x224,
+ * one byte per pixel, values 1..19, written into the page of the slot
+ * being drawn.  Pages are 224 rows of `stride` bytes (a multiple of 4,
+ * at least 256) and word-aligned. */
+#define VBDS_PAGE_W      256
+#define VBDS_PAGE_VALUES 20             /* palette entries 0..19 */
+void vbds_vip_set_page_output(uint8_t* page0, uint8_t* page1, int stride);
+int  vbds_vip_page_level(int value);    /* red 0..255 for a page value */
+int  vbds_vip_display_slot(void);
+/* Keep the 2-bit framebuffer up to date (default on).  Off saves work when
+ * only page output is shown; it turns itself back on if the game writes
+ * framebuffer memory. */
+void vbds_vip_set_pack(int enabled);
+/* Testing: 0 redraws every block. */
+void vbds_vip_set_skipping(int enabled);
+int  vbds_vip_page_stale(int slot);
+void vbds_vip_refresh_page(int slot);
 
 /* Red intensity 0..255 for framebuffer pixel value 0..3. */
 int vbds_vip_level(int v);

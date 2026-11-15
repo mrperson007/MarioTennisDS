@@ -21,6 +21,10 @@ static uint8_t  s_cart_ram[65536];
 static uint8_t  s_misc_wcr;
 #define s_wram ((uint8_t*)s_wram_store)
 
+uint8_t*       vbds_wram_ptr = (uint8_t*)s_wram_store;
+const uint8_t* vbds_rom_ptr;
+uint32_t       vbds_rom_mask;
+
 static uint64_t s_timer_cycle, s_vip_cycle, s_vsu_cycle, s_input_cycle;
 
 const uint8_t* vbds_wram(void) { return s_wram; }
@@ -28,6 +32,8 @@ const uint8_t* vbds_wram(void) { return s_wram; }
 void vbds_bus_init(const uint8_t* rom, uint32_t rom_size) {
     s_rom = rom;
     s_rom_mask = rom_size - 1u;
+    vbds_rom_ptr = rom;
+    vbds_rom_mask = rom_size - 1u;
     s_timer_cycle = s_vip_cycle = s_vsu_cycle = s_input_cycle = 0;
     s_misc_wcr = 0;
     memset(s_wram_store, 0, sizeof(s_wram_store));
@@ -152,6 +158,7 @@ static uint32_t io_read(unsigned region, uint32_t p, unsigned width) {
 
 static void io_write(unsigned region, uint32_t p, uint32_t v, unsigned width) {
     io_begin(region, p, 1);
+    if (region == 1) { vb_vsu_write8(p, (uint8_t)v); return; }
     switch (region) {
         case 0:
             if (width == 1) vb_vip_write8(p, (uint8_t)v);
@@ -177,54 +184,67 @@ static void io_write(unsigned region, uint32_t p, uint32_t v, unsigned width) {
 
 #define REGION(a) (((a) >> 24) & 7u)
 
-uint8_t vb_read8(uint32_t addr) {
+/* Video memory (not registers) has no timing side effects, so it skips the
+ * device synchronisation that register accesses need. */
+static inline int vip_is_reg(uint32_t addr) {
+    uint32_t o = addr & 0x7FFFFu;
+    return o >= 0x5F800u && o < 0x5F900u;
+}
+
+VBDS_FAST uint8_t vb_read8(uint32_t addr) {
     unsigned region = REGION(addr);
     if (region == 5) return s_wram[addr & 0xFFFFu];
     if (region == 7) return s_rom[addr & s_rom_mask];
     if (region == 6) return s_cart_ram[addr & 0xFFFFu];
+    if (region == 0 && !vip_is_reg(addr)) return vb_vip_read8(addr);
     return (uint8_t)io_read(region, addr & 0x07FFFFFFu, 1);
 }
 
-uint16_t vb_read16(uint32_t addr) {
+VBDS_FAST uint16_t vb_read16(uint32_t addr) {
     unsigned region = REGION(addr);
     addr &= ~1u;
     if (region == 5) { const uint8_t* p = &s_wram[addr & 0xFFFFu]; return (uint16_t)(p[0] | (p[1] << 8)); }
     if (region == 7) { const uint8_t* p = &s_rom[addr & s_rom_mask]; return (uint16_t)(p[0] | (p[1] << 8)); }
     if (region == 6) return (uint16_t)(s_cart_ram[addr & 0xFFFFu] | (s_cart_ram[(addr + 1) & 0xFFFFu] << 8));
+    if (region == 0 && !vip_is_reg(addr)) return vb_vip_read16(addr);
     return (uint16_t)io_read(region, addr & 0x07FFFFFFu, 2);
 }
 
-uint32_t vb_read32(uint32_t addr) {
+VBDS_FAST uint32_t vb_read32(uint32_t addr) {
     unsigned region = REGION(addr);
     addr &= ~3u;
     if (region == 5) { uint32_t v; memcpy(&v, &s_wram[addr & 0xFFFFu], 4); return v; }
     if (region == 7) { uint32_t v; memcpy(&v, &s_rom[addr & s_rom_mask], 4); return v; }
     if (region == 6) { uint32_t v; memcpy(&v, &s_cart_ram[addr & 0xFFFFu], 4); return v; }
+    if (region == 0 && !vip_is_reg(addr)) return vb_vip_read32(addr);
     return io_read(region, addr & 0x07FFFFFFu, 4);
 }
 
-void vb_write8(uint32_t addr, uint8_t v) {
+VBDS_FAST void vb_write8(uint32_t addr, uint8_t v) {
     unsigned region = REGION(addr);
     if (region == 5) { s_wram[addr & 0xFFFFu] = v; return; }
     if (region == 6) { s_cart_ram[addr & 0xFFFFu] = v; return; }
     if (region == 7) vbds_fatal("write to cartridge ROM", vbds_cpu.pc, addr);
+    if (region == 0 && !vip_is_reg(addr)) { vb_vip_write8(addr, v); return; }
     io_write(region, addr & 0x07FFFFFFu, v, 1);
 }
 
-void vb_write16(uint32_t addr, uint16_t v) {
+VBDS_FAST void vb_write16(uint32_t addr, uint16_t v) {
     unsigned region = REGION(addr);
     addr &= ~1u;
     if (region == 5) { uint8_t* p = &s_wram[addr & 0xFFFFu]; p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); return; }
     if (region == 6) { s_cart_ram[addr & 0xFFFFu] = (uint8_t)v; s_cart_ram[(addr + 1) & 0xFFFFu] = (uint8_t)(v >> 8); return; }
     if (region == 7) vbds_fatal("write to cartridge ROM", vbds_cpu.pc, addr);
+    if (region == 0 && !vip_is_reg(addr)) { vb_vip_write16(addr, v); return; }
     io_write(region, addr & 0x07FFFFFFu, v, 2);
 }
 
-void vb_write32(uint32_t addr, uint32_t v) {
+VBDS_FAST void vb_write32(uint32_t addr, uint32_t v) {
     unsigned region = REGION(addr);
     addr &= ~3u;
     if (region == 5) { memcpy(&s_wram[addr & 0xFFFFu], &v, 4); return; }
     if (region == 6) { memcpy(&s_cart_ram[addr & 0xFFFFu], &v, 4); return; }
     if (region == 7) vbds_fatal("write to cartridge ROM", vbds_cpu.pc, addr);
+    if (region == 0 && !vip_is_reg(addr)) { vb_vip_write32(addr, v); return; }
     io_write(region, addr & 0x07FFFFFFu, v, 4);
 }

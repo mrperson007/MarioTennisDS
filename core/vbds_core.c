@@ -15,7 +15,7 @@
 CPUState vbds_cpu;
 uint32_t (*vbds_tick_source)(void);
 uint32_t vbds_prof_draw_ticks, vbds_prof_blocks_drawn, vbds_prof_blocks_skipped;
-uint32_t vbds_prof_passes;
+uint32_t vbds_prof_passes, vbds_prof_game_ticks;
 static uint64_t s_frame_start;
 
 void vbds_bus_init(const uint8_t* rom, uint32_t rom_size);
@@ -82,7 +82,13 @@ void vbds_run_frame(void) {
         if (c->cycle_deadline > frame_end) c->cycle_deadline = frame_end;
         c->step_budget = 250000;
         c->yielded = 0;
+        /* Game time, not counting video drawn from inside the game's
+         * memory accesses (that is counted as drawing). */
+        uint32_t t0 = vbds_tick_source ? vbds_tick_source() : 0;
+        uint32_t d0 = vbds_prof_draw_ticks;
         vb_dispatch(c, c->pc);
+        if (vbds_tick_source)
+            vbds_prof_game_ticks += vbds_tick_source() - t0 - (vbds_prof_draw_ticks - d0);
         vbds_devices_sync(c->cycles);
         if (!c->yielded && !c->halted)
             vbds_fatal("dispatcher returned without yielding or halting", c->pc, 0);
