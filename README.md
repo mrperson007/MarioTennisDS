@@ -13,7 +13,7 @@ small-footprint runtime.
 -It runs at 100% speed now in Melonds
 - Left eye only, reduced from 384x224 to 256x149 with averaging so small
   text stays readable.
-- No sound yet.
+- Full sound.
 - Works on real hardware.
 
 The game logic is checked against the original PC runtime: work RAM and
